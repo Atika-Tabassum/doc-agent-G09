@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from doc_agent.contracts import Chunk
-from doc_agent.index import chunk, embed
+from doc_agent.index import chunk, embed, store
 
 
 class _FakeEmbedModel:
@@ -210,3 +210,137 @@ def test_encode_real_model_smoke():
     assert vectors.shape == (1, 768)
     assert vectors.dtype == np.float32
     assert abs(float(np.linalg.norm(vectors[0])) - 1.0) < 1e-3
+
+
+def test_store_build_and_load_round_trip(tmp_path):
+    """store.build()/load() is the persistence boundary between index/{embed,chunk}.py and the
+    (still-A3) retriever -- a mismatch here (wrong row order, dropped field) would silently
+    corrupt every future retrieval result without any of the embed/chunk-level tests catching it.
+    Using index.type "faiss:flat" (exact IndexFlatIP) rather than the production "faiss:hnsw"
+    default keeps this deterministic; HNSW's approximate search isn't what's under test here."""
+    processed_dir = tmp_path / "data" / "processed"
+    processed_dir.mkdir(parents=True)
+    index_dir = processed_dir / "index"
+    cfg = {
+        "paths": {"processed_dir": str(processed_dir), "index_dir": str(index_dir)},
+        "index": {"type": "faiss:flat"},
+    }
+
+    chunks = [
+        Chunk(id="doc1_c00000", doc_id="doc1", text="prothom", page_ids=["doc1_p001"]),
+        Chunk(id="doc1_c00001", doc_id="doc1", text="dwitiyo", page_ids=["doc1_p001", "doc1_p002"]),
+    ]
+    # Vectors don't need to come from a real model for this test -- store.build()/load() treat
+    # them as opaque float32 rows; only their count/order relative to `chunks` matters here.
+    rng = np.random.default_rng(0)
+    vectors = rng.random((2, 8)).astype("float32")
+    vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+
+    store.build(chunks, vectors, cfg)
+    faiss_index, chunk_rows = store.load(cfg)
+
+    assert faiss_index.ntotal == 2
+    assert len(chunk_rows) == 2
+    for original_chunk, row in zip(chunks, chunk_rows, strict=True):
+        assert row["id"] == original_chunk.id
+        assert row["doc_id"] == original_chunk.doc_id
+        assert row["text"] == original_chunk.text
+        assert row["page_ids"] == original_chunk.page_ids
+
+
+def test_store_load_raises_file_not_found_with_helpful_message(tmp_path):
+    """store.load() is the first thing a fresh checkout (or a CI runner) hits if someone forgets
+    to build the index first -- the error needs to actually say what to run next, not just that
+    something's missing, so this test locks the message wording as part of the contract, not just
+    the exception type."""
+    missing_index_dir = tmp_path / "data" / "processed" / "index"
+    cfg = {"paths": {"index_dir": str(missing_index_dir)}}
+
+    with pytest.raises(FileNotFoundError) as exc_info:
+        store.load(cfg)
+
+    assert str(missing_index_dir) in str(exc_info.value)
+    assert "run scripts/build_index.sh first" in str(exc_info.value)
+
+
+def test_store_nearest_neighbor_returns_exact_match(tmp_path):
+    """Proves the FAISS index actually implements similarity search correctly (not just that
+    build()/load() round-trip files) -- searching with a chunk's own embedding should return
+    that exact chunk as the top hit with score ~1.0 (cosine similarity of a unit vector with
+    itself). "faiss:flat" (exact IndexFlatIP) is used deliberately instead of the production
+    "faiss:hnsw" default, since HNSW is an *approximate* nearest-neighbor index -- it isn't
+    guaranteed to return the true top-1 on every query, which would make this test flaky."""
+    processed_dir = tmp_path / "data" / "processed"
+    processed_dir.mkdir(parents=True)
+    index_dir = processed_dir / "index"
+    cfg = {
+        "paths": {"processed_dir": str(processed_dir), "index_dir": str(index_dir)},
+        "index": {"type": "faiss:flat"},
+    }
+
+    chunks = [
+        Chunk(id=f"doc1_c{i:05d}", doc_id="doc1", text=f"line {i}", page_ids=["doc1_p001"])
+        for i in range(5)
+    ]
+    rng = np.random.default_rng(1)
+    vectors = rng.random((5, 8)).astype("float32")
+    vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+
+    store.build(chunks, vectors, cfg)
+    faiss_index, chunk_rows = store.load(cfg)
+
+    query = vectors[2:3]  # an exact copy of chunk index 2's own embedding
+    scores, ids = faiss_index.search(query, 1)
+
+    assert chunk_rows[ids[0][0]]["id"] == "doc1_c00002"
+    assert scores[0][0] == pytest.approx(1.0, abs=1e-4)
+
+
+def test_store_build_propagates_chunk_meta_tier_and_confidence(tmp_path):
+    """contracts.Chunk (fixed, can't add fields) has no slot for OCR confidence or silver/gold
+    tier -- store.build() has to join them in from chunk_meta.jsonl (written by chunk.split(),
+    see chunk.py) by chunk id, and this is the only place that join happens. A silent keying bug
+    here (e.g. matching by list position instead of id) would make every downstream evidence-tier
+    disclosure wrong without any of the round-trip/NN tests above noticing, since they don't
+    populate chunk_meta.jsonl at all."""
+    processed_dir = tmp_path / "data" / "processed"
+    processed_dir.mkdir(parents=True)
+    index_dir = processed_dir / "index"
+
+    meta_rows = [
+        {
+            "chunk_id": "doc1_c00000",
+            "ocr_confidence": 0.91,
+            "tier": "gold",
+            "source_line_ids": ["doc1_p001_l01"],
+        },
+        {
+            "chunk_id": "doc1_c00001",
+            "ocr_confidence": 0.42,
+            "tier": "silver",
+            "source_line_ids": ["doc1_p001_l02"],
+        },
+    ]
+    with open(processed_dir / "chunk_meta.jsonl", "w", encoding="utf-8") as f:
+        for row in meta_rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    cfg = {
+        "paths": {"processed_dir": str(processed_dir), "index_dir": str(index_dir)},
+        "index": {"type": "faiss:flat"},
+    }
+    chunks = [
+        Chunk(id="doc1_c00000", doc_id="doc1", text="gold line", page_ids=["doc1_p001"]),
+        Chunk(id="doc1_c00001", doc_id="doc1", text="silver line", page_ids=["doc1_p001"]),
+    ]
+    # Orthogonal unit rows -- values don't matter, only that build()/load() treat them opaquely.
+    vectors = np.eye(2, 8, dtype="float32")
+
+    store.build(chunks, vectors, cfg)
+    _, chunk_rows = store.load(cfg)
+    by_id = {row["id"]: row for row in chunk_rows}
+
+    assert by_id["doc1_c00000"]["tier"] == "gold"
+    assert by_id["doc1_c00000"]["ocr_confidence"] == pytest.approx(0.91)
+    assert by_id["doc1_c00001"]["tier"] == "silver"
+    assert by_id["doc1_c00001"]["ocr_confidence"] == pytest.approx(0.42)
