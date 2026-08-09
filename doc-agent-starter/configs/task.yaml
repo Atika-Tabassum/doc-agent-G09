@@ -1,7 +1,11 @@
 # Stage 0 — problem statement (one per group). Set by assignment.
-group_id: "G00"
-domain: "almanacs/panjika"
-data_speciality: "degraded-scans"   # ONE hard corpus property (English is not one)
-primary_nfr: "reproducible"
-nfr_target: "p95 latency <= 300ms"   # your concrete committed target
-corpus: {min_pages: 300, min_words: 60000, source_url: "", license: ""}
+group_id: "G09"
+domain: "bengali-medium-literature-education"   # HSC/Honours Bengali-lit students & tutors, Tagore set texts
+data_speciality: "dirty-ocr"        # silver-only reference text: IA's own OCR is the only text layer we are handed,
+                                     # no independent gold transcription ships with the corpus (A1 Section 1, axis 2)
+primary_nfr: "explainable"          # Explanation-Completeness Rate (ECR) >= 0.80: page+line citation, tool trace,
+                                     # and an explicit silver/gold evidence-tier disclosure per answer (A1 Section 1, axis 3)
+nfr_target: "ECR >= 0.80 (page_id + line_id + verbatim span + tool trace + silver/gold tier, all four required)"
+corpus:
+  {min_pages: 300,min_words: 60000,source_url: "https://archive.org/details/RABINDRARACHANABALI"   # Rabindra Rachanabali, Vol. 25 (437 pages)
+  ,license: "CC0-1.0"}

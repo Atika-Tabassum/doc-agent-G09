@@ -1,6 +1,8 @@
-# Corpus provenance (A1 — fill this)
-- Source (URL):
-- Licence / usage rights:
-- Pages: __   Words: __   Size on disk: __
-- Scan/script difficulty notes:
-- Split policy (by document):
+# Corpus provenance
+
+-Source (URL): https://archive.org/details/RABINDRARACHANABALI — Rabindra Rachanabali (রবীন্দ্র রচনাবলী), Volume 25, scanned page images (not pre-typed text). Secondary reference (grounding verification only, never the primary corpus): Bichitra — Online Tagore Variorum, bichitra.jdvu.ac.in.
+-Licence / usage rights: CC0 1.0 Universal (public-domain dedication), as declared on the Internet Archive item page. Freely downloadable, redistributable, reusable; attribution not legally required under CC0 but IA + uploader are credited here regardless.
+-Pages / Words / Size on disk: 437 pages / 87,848 words / ~9 MB 
+-Scan/script difficulty notes: 1950s-era Bengali letterpress printing; Bengali conjunct consonants (যুক্তাক্ষর) and dependent vowel signs (matras) cause character-segmentation errors in conventional OCR. Aged paper, uneven illumination, occasional page skew, decorative headings. Predominantly single-column (A1 Section 3) — poetry indentation and headings are the main source of layout variation, not multi-column structure.
+-Split policy (by document): Split at the literary-work level, never by page or chunk — an entire work (e.g. *Tin Sangi*, *Chandalika*) is assigned to exactly one of train/val/test via a `SPLIT_MAP`, so no work contributes text to more than one partition. A1-reported split: ≈65% train / 22% val / 13% test by word count.
+- Data speciality — silver-only reference text: the only machine-readable text IA ships for this volume is its own OCR pass over the same 1948 letterpress scan (a *silver*, not *gold*, reference — IA itself flags low-confidence pages in-band). There is no independent gold transcription shipped with the item; `grading_kit/heldout_pages/` + `labels.jsonl` are this project's own independently-reviewed gold sample, seeded here and grown through A2–A3.
