@@ -2,10 +2,34 @@
 
 import json
 
+import numpy as np
 import pytest
 
 from doc_agent.contracts import Chunk
-from doc_agent.index import chunk
+from doc_agent.index import chunk, embed
+
+
+class _FakeEmbedModel:
+    """Deterministic stand-in for a SentenceTransformer, injected via monkeypatching
+    embed._load_model. Avoids a real network/HF-hub download in every test run while still
+    exercising embed.encode()'s own logic (e5 prefixing, batching, dtype/shape handling) --
+    only the model's inference is faked, not encode() itself. Records every call's args so
+    tests can assert on what text actually reached the "model" (e.g. e5 prefixing)."""
+
+    def __init__(self, dim: int = 8, seed: int = 42):
+        self.dim = dim
+        self._rng = np.random.default_rng(seed)  # fixed seed -> reproducible vectors across runs
+        self.calls: list[dict] = []
+
+    def encode(self, texts, batch_size=32, convert_to_numpy=True, normalize_embeddings=True):
+        # convert_to_numpy is accepted-but-unused: kept only so this fake's signature matches the
+        # real SentenceTransformer.encode() that embed.py calls with it as a keyword argument --
+        # this fake always returns a numpy array regardless of the flag's value.
+        self.calls.append({"texts": list(texts), "batch_size": batch_size})
+        vectors = self._rng.random((len(texts), self.dim)).astype("float32")
+        if normalize_embeddings:
+            vectors = vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
+        return vectors
 
 
 def test_split_reads_evidence_tier_key_without_crashing(tmp_path):
@@ -124,3 +148,65 @@ def test_split_rejects_overlap_gte_chunk_tokens(tmp_path):
 
     with pytest.raises(ValueError):
         chunk.split(lines, {**base_cfg, "index": {"chunk_tokens": 10, "overlap": 15}})
+
+
+def test_encode_output_shape_dtype_and_unit_norm(monkeypatch):
+    """embed.encode()'s core contract: one row per chunk, correct dim, float32, L2-normalized --
+    store.py's FAISS index uses METRIC_INNER_PRODUCT, so an un-normalized row would silently break
+    cosine-similarity search without ever raising an error. Monkeypatching _load_model means this
+    never touches the network or downloads the real ~1.1GB multilingual-e5-base model."""
+    fake_model = _FakeEmbedModel(dim=8)
+    monkeypatch.setattr(embed, "_load_model", lambda model_name, device: fake_model)
+
+    chunks = [
+        Chunk(id="doc1_c00000", doc_id="doc1", text="প্রথম বাক্য", page_ids=["doc1_p001"]),
+        Chunk(id="doc1_c00001", doc_id="doc1", text="দ্বিতীয় বাক্য", page_ids=["doc1_p001"]),
+        Chunk(id="doc1_c00002", doc_id="doc1", text="তৃতীয় বাক্য", page_ids=["doc1_p002"]),
+    ]
+    cfg = {"device": "cpu", "embed": {"model": "intfloat/multilingual-e5-base", "batch_size": 2}}
+
+    vectors = embed.encode(chunks, cfg)
+
+    assert vectors.shape == (len(chunks), 8)
+    assert vectors.dtype == np.float32
+    norms = np.linalg.norm(vectors, axis=1)
+    np.testing.assert_allclose(norms, 1.0, atol=1e-5)
+
+
+def test_encode_prefixes_e5_model_input_with_passage(monkeypatch):
+    """e5-family models (per the model card intfloat/multilingual-e5-base ships under) expect
+    indexed text prefixed with "passage: " -- without it, retrieval quality silently degrades
+    rather than erroring, so this needs its own explicit test rather than relying on the shape/
+    dtype test above to happen to catch it. Asserting on _FakeEmbedModel.calls (what text the
+    "model" actually received) checks the prefix is applied, not just that some output came back."""
+    fake_model = _FakeEmbedModel(dim=8)
+    monkeypatch.setattr(embed, "_load_model", lambda model_name, device: fake_model)
+
+    chunks = [Chunk(id="doc1_c00000", doc_id="doc1", text="মূল লাইন", page_ids=["doc1_p001"])]
+    cfg = {"device": "cpu", "embed": {"model": "intfloat/multilingual-e5-base", "batch_size": 1}}
+
+    embed.encode(chunks, cfg)
+
+    assert len(fake_model.calls) == 1
+    assert fake_model.calls[0]["texts"] == ["passage: মূল লাইন"]
+
+
+@pytest.mark.skip(reason="downloads real model; run manually")
+def test_encode_real_model_smoke():
+    """One-time manual check that the REAL intfloat/multilingual-e5-base model (not the fake
+    above) actually works end-to-end -- the mocked tests above only prove embed.encode()'s own
+    logic is correct, not that the real model/weights load and produce sane output. Skip-marked
+    so `make test`/CI never needs network access or a ~1.1GB download; vanilla pytest has no CLI
+    flag to override an individual @pytest.mark.skip, so to run this manually, comment out the
+    skip marker above, run `pytest tests/test_retrieval.py -k real_model_smoke -v`, then restore
+    the marker before committing."""
+    chunks = [
+        Chunk(id="doc1_c00000", doc_id="doc1", text="বাস্তব মডেল পরীক্ষা", page_ids=["doc1_p001"])
+    ]
+    cfg = {"device": "cpu", "embed": {"model": "intfloat/multilingual-e5-base", "batch_size": 1}}
+
+    vectors = embed.encode(chunks, cfg)
+
+    assert vectors.shape == (1, 768)
+    assert vectors.dtype == np.float32
+    assert abs(float(np.linalg.norm(vectors[0])) - 1.0) < 1e-3
