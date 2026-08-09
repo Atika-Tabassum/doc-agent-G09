@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from doc_agent.contracts import Chunk
 from doc_agent.index import chunk
 
@@ -76,3 +78,49 @@ def test_split_merges_lines_within_a_document_with_overlap(tmp_path):
     assert out[0].page_ids == ["workA_p0001", "workA_p0002"]
     assert out[1].page_ids == ["workA_p0002", "workA_p0003"]
     assert out[2].page_ids == ["workA_p0003"]
+
+
+def test_split_never_merges_across_documents(tmp_path):
+    """chunk.split() must never merge lines across different doc_id -- doing so would
+    reintroduce the leakage the A1 document-level train/val/test split exists to prevent."""
+    processed_dir = tmp_path / "data" / "processed"
+    processed_dir.mkdir(parents=True)
+
+    lines = [
+        Chunk(
+            id="workA_p0001_l000", doc_id="workA", text="a1 a2 a3 a4 a5", page_ids=["workA_p0001"]
+        ),
+        Chunk(
+            id="workB_p0001_l000", doc_id="workB", text="b1 b2 b3 b4 b5", page_ids=["workB_p0001"]
+        ),
+    ]
+    cfg = {
+        "index": {"chunk_tokens": 6, "overlap": 2},
+        "paths": {"processed_dir": str(processed_dir)},
+    }
+
+    out = chunk.split(lines, cfg)
+
+    assert len(out) == 2
+    by_doc = {c.doc_id: c for c in out}
+    assert set(by_doc.keys()) == {"workA", "workB"}
+    a_tokens = set(by_doc["workA"].text.split())
+    b_tokens = set(by_doc["workB"].text.split())
+    assert a_tokens == {"a1", "a2", "a3", "a4", "a5"}
+    assert b_tokens == {"b1", "b2", "b3", "b4", "b5"}
+    assert not a_tokens & b_tokens  # neither chunk's text contains a token from the other doc
+
+
+def test_split_rejects_overlap_gte_chunk_tokens(tmp_path):
+    """overlap must be strictly less than chunk_tokens -- equal or greater makes the sliding
+    window either stall (step <= 0) or go backwards."""
+    processed_dir = tmp_path / "data" / "processed"
+    processed_dir.mkdir(parents=True)
+    lines = [Chunk(id="w_p0001_l000", doc_id="w", text="x y z", page_ids=["w_p0001"])]
+    base_cfg = {"paths": {"processed_dir": str(processed_dir)}}
+
+    with pytest.raises(ValueError):
+        chunk.split(lines, {**base_cfg, "index": {"chunk_tokens": 10, "overlap": 10}})
+
+    with pytest.raises(ValueError):
+        chunk.split(lines, {**base_cfg, "index": {"chunk_tokens": 10, "overlap": 15}})
