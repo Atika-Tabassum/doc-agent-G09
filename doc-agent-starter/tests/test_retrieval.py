@@ -41,3 +41,38 @@ def test_split_reads_evidence_tier_key_without_crashing(tmp_path):
     assert len(rows) == 1
     # two gold source lines + one silver -> conservative aggregation: "silver", not "gold"
     assert rows[0]["tier"] == "silver"
+
+
+def test_split_merges_lines_within_a_document_with_overlap(tmp_path):
+    """chunk_tokens=6, overlap=2 -> step=4. Three 4-token lines (12 tokens total) on three
+    different pages must produce 3 windows of sizes [6, 6, 4], where each window's last 2 tokens
+    equal the next window's first 2 tokens, and each window's page_ids is the sorted union of
+    every source line it touches."""
+    processed_dir = tmp_path / "data" / "processed"
+    processed_dir.mkdir(parents=True)
+
+    lines = [
+        Chunk(id="workA_p0001_l000", doc_id="workA", text="w1 w2 w3 w4", page_ids=["workA_p0001"]),
+        Chunk(id="workA_p0002_l000", doc_id="workA", text="w5 w6 w7 w8", page_ids=["workA_p0002"]),
+        Chunk(
+            id="workA_p0003_l000", doc_id="workA", text="w9 w10 w11 w12", page_ids=["workA_p0003"]
+        ),
+    ]
+    cfg = {
+        "index": {"chunk_tokens": 6, "overlap": 2},
+        "paths": {"processed_dir": str(processed_dir)},
+    }
+
+    out = chunk.split(lines, cfg)
+
+    assert len(out) == 3
+    token_counts = [len(c.text.split()) for c in out]
+    assert token_counts == [6, 6, 4]
+
+    # overlap: each window's last 2 tokens == the next window's first 2 tokens
+    for a, b in zip(out, out[1:], strict=False):
+        assert a.text.split()[-2:] == b.text.split()[:2]
+
+    assert out[0].page_ids == ["workA_p0001", "workA_p0002"]
+    assert out[1].page_ids == ["workA_p0002", "workA_p0003"]
+    assert out[2].page_ids == ["workA_p0003"]
