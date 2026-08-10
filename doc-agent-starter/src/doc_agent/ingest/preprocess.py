@@ -1,3 +1,4 @@
+# File: src/doc_agent/ingest/preprocess.py
 """Stage 1 — deskew / denoise / binarize / augment"""
 from __future__ import annotations
 
@@ -16,20 +17,43 @@ _SKEW_ROTATE_THRESHOLD_DEG = 0.5
 _BLANK_INK_PIXEL_RATIO = 0.002  # below this share of foreground pixels, treat the page as blank/separator
 
 
+def _estimate_skew_angle(gray: np.ndarray) -> float:
+    """Projection-profile skew estimate: search a bounded range of realistic scanner-skew angles
+    (+-10deg) and pick the one that makes the horizontal ink-row histogram most 'peaky' (text lines
+    stacked at sharp, well-separated rows) -- what real scanner skew actually produces. This replaces
+    an earlier cv2.minAreaRect()-over-the-whole-page estimate, which was empirically found (by
+    comparing processed output against the original scans on the real corpus) to occasionally report
+    angles of several degrees, or even close to 90deg, on pages that were already straight -- a known
+    failure mode of minAreaRect's angle convention on an aggregate ink-pixel cloud whose orientation
+    is ambiguous near the ~45deg/~90deg boundaries. Restricting the search to +-10deg makes that
+    catastrophic misrotation structurally impossible: 90deg is simply never a candidate."""
+    _, fg = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    small = cv2.resize(fg, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)  # speed; skew doesn't need full-res
+    h, w = small.shape
+    center = (w / 2, h / 2)
+
+    best_angle, best_score = 0.0, -1.0
+    for angle_tenths in range(-100, 101, 2):  # -10.0 .. +10.0 degrees, 0.2-degree steps
+        angle = angle_tenths / 10.0
+        m = cv2.getRotationMatrix2D(center, angle, 1.0)
+        rotated = cv2.warpAffine(small, m, (w, h), flags=cv2.INTER_NEAREST, borderValue=0)
+        row_sums = rotated.sum(axis=1).astype(np.float64)
+        score = row_sums.var()  # sharp, well-separated text-line rows -> high row-sum variance
+        if score > best_score:
+            best_score, best_angle = score, angle
+    return best_angle
+
+
 def _deskew(gray: np.ndarray) -> np.ndarray:
-    """Hough-transform / connected-component skew estimate restricted to text regions, rotate if > 0.5deg.
+    """Projection-profile skew estimate (see _estimate_skew_angle), rotate if > 0.5deg.
     A1: 'Border/margin cropping followed by Hough-transform or CCA skew detection ... automatic rotation
     exceeding 0.5deg.'
     """
-    # foreground = ink (works on the raw grayscale scan, before binarization)
     _, fg = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     coords = cv2.findNonZero(fg)
     if coords is None or len(coords) < 50:
         return gray
-    angle = cv2.minAreaRect(coords)[-1]
-    # cv2.minAreaRect angle convention: normalise to [-45, 45]
-    if angle < -45:
-        angle = 90 + angle
+    angle = _estimate_skew_angle(gray)
     if abs(angle) <= _SKEW_ROTATE_THRESHOLD_DEG:
         return gray
     (h, w) = gray.shape
