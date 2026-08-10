@@ -20,7 +20,7 @@ def _tess_config(cfg: dict) -> tuple[str, str]:
     ocr_cfg = cfg.get("ocr", {})
     lang = ocr_cfg.get("lang", "ben")
     oem = ocr_cfg.get("oem", 1)
-    psm = ocr_cfg.get("psm", 3)
+    psm = ocr_cfg.get("psm", 4)
     return lang, f"--oem {oem} --psm {psm}"
 
 def _group_words_into_lines(data: dict, score_thr: float) -> list[dict]:
