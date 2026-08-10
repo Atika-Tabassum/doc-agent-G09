@@ -93,7 +93,7 @@ def split(chunks: list[Chunk], cfg: dict) -> list[Chunk]:
 
             source_ids = {s.id for s in window_sources}
             confs = [ocr_meta[sid]["ocr_confidence"] for sid in source_ids if sid in ocr_meta]
-            tiers = [ocr_meta[sid]["tier"] for sid in source_ids if sid in ocr_meta]
+            tiers = [ocr_meta[sid]["evidence_tier"] for sid in source_ids if sid in ocr_meta]
             mean_conf = sum(confs) / len(confs) if confs else 0.0
             tier = "gold" if tiers and all(t == "gold" for t in tiers) else "silver"
             meta_rows.append({"chunk_id": chunk_id, "ocr_confidence": mean_conf, "tier": tier,

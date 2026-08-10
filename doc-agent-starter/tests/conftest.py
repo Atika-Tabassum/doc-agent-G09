@@ -1,13 +1,15 @@
-"""Unit test home for ingest. CI runs these."""
+"""Shared pytest fixtures for tests/ — anything more than one test file needs goes here, not
+duplicated per-file. Restores the synthetic_corpus fixture that tests/test_ingest.py and
+tests/test_ocr.py both depend on (git history: it originally lived here, then got merged directly
+into test_ocr.py in commit c75d0d1 "merged conftest with test_ocr" -- which fixed test_ocr.py's own
+imports but silently broke test_ingest.py, which was never updated to match and still expects a
+conftest-provided fixture, not a local one)."""
+
 from __future__ import annotations
 
 import pytest
 
-from doc_agent.ingest import loader, preprocess
 from doc_agent.ingest.preprocess import _BLANK_INK_PIXEL_RATIO
-
-# synthetic_corpus fixture is defined locally (not shared via tests/conftest.py) so this file has
-# no dependency on that module. See tests/conftest.py for test_ocr.py's copy of the same fixture.
 
 # Common TrueType font locations across Linux distros / CI images / macOS. PIL's
 # ImageFont.load_default() (no args) fallback renders an ~6x11px bitmap font that is FAR too small
@@ -103,38 +105,3 @@ def synthetic_corpus(tmp_path):
         "grading_kit": {"labels_path": str(tmp_path / "grading_kit" / "labels.jsonl")},
     }
     return cfg
-
-
-def test_load_pages_groups_by_document_and_sorts(synthetic_corpus):
-    pages = loader.load_pages(synthetic_corpus)
-    assert [p.id for p in pages] == ["testwork_p0001", "testwork_p0002"]
-    assert all(p.doc_id == "testwork" for p in pages)
-
-
-def test_load_pages_missing_dir_raises(tmp_path):
-    cfg = {"paths": {"raw_dir": str(tmp_path / "nonexistent")}}
-    
-    with pytest.raises(FileNotFoundError):
-        loader.load_pages(cfg)
-
-
-def test_preprocess_drops_blank_pages(synthetic_corpus, tmp_path):
-    from PIL import Image
-    raw_dir = tmp_path / "data" / "raw" / "testwork"
-    Image.new("L", (800, 600), color=255).save(raw_dir / "3.png")  # blank page, no text drawn
-
-    pages = loader.load_pages(synthetic_corpus)
-    assert len(pages) == 3
-
-    out = preprocess.run(pages, synthetic_corpus)
-    assert len(out) == 2  # the blank page is dropped
-    assert all(p.id != "testwork_p0003" for p in out)
-
-
-def test_preprocess_writes_processed_images(synthetic_corpus):
-    from pathlib import Path
-    pages = loader.load_pages(synthetic_corpus)
-    out = preprocess.run(pages, synthetic_corpus)
-    for p in out:
-        assert Path(p.image_path).exists()
-        assert "processed" in p.image_path
