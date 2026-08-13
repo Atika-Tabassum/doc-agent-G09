@@ -4,23 +4,23 @@
 # ONLY this file; it points to the rest. Build/run scripts and the eval
 # tasks are NAMED here, not copied, so they never go stale.
 
-project_id: ""              # your team id
+project_id: "G09"              # your team id
 
 axes:
-  domain: ""                # your corpus subject / real user (see Roster; one per team)
-  data_speciality: ""       # ONE hard property of your corpus you are handed (see Data-Speciality Catalog)
+  domain: "bengali-medium-literature-education"                # your corpus subject / real user (see Roster; one per team)
+  data_speciality: "dirty-ocr"       # ONE hard property of your corpus you are handed (see Data-Speciality Catalog)
                             #   e.g. bangla | arabic | code-switching | degraded-scans | multi-column |
                             #        handwritten | old-orthography | math-notation | dirty-ocr | ...
                             #   (English is not a speciality; if your corpus is English, pick a data condition.)
-  primary_nfr: ""           # ONE quality you optimise ABOVE baseline (see NFR sheet). Faithful &
+  primary_nfr: "explainable"           # ONE quality you optimise ABOVE baseline (see NFR sheet). Faithful &
                             #   accurate are REQUIRED of everyone (baseline), so they are NOT choices.
-  nfr_target: ""            # the concrete target you commit to for that NFR, e.g. "p95 latency <= 300ms",
+  nfr_target: "ECR >= 0.80 (page_id + line_id + verbatim span + tool trace + silver/gold tier, all four required)"            # the concrete target you commit to for that NFR, e.g. "p95 latency <= 300ms",
                             #   "peak RAM <= 2GB", "ECE <= 0.05", "PII recall >= 0.98"
 
 corpus:
   path: data/raw/                   # where the scanned page-images live
-  pages: 0                          # total pages  (floor: >= 300)
-  words: 0                          # total words  (floor: >= 60000)
+  pages: 437                      # total pages  (floor: >= 300)
+  words: 87,848                          # total words  (floor: >= 60000)
   provenance: data/provenance.md    # source + licence + counts
 
 heldout:
