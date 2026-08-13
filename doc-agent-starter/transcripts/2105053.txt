@@ -1,0 +1,4076 @@
+========================================================================
+HEADER
+========================================================================
+Member name: Atika Tabassum Suchi
+Student number: 2105053
+Sections led: Person B — Vision & OCR
+  - src/doc_agent/vision/layout.py (Stage 2: layout/line detection, noise-box filtering,
+    min line height/area thresholds)
+  - src/doc_agent/vision/ocr.py (Stage 3: OCR transcription, gold/silver evidence-tier
+    gating, fuzzy DP line alignment against reference text with tolerance for small
+    line-count mismatches)
+  - tests/test_ocr.py, tests/test_layout.py
+  - notebooks/kb_demo.ipynb — Section 1 (OCR quality: CER/WER scoring against the
+    held-out gold set, WER tokenization fix for punctuation-glued tokens)
+  - forms/A2_form.docx — [FILL IN which section(s) you led, if any]
+
+========================================================================
+FULL CONVERSATION (unedited)
+========================================================================
+
+User: *Classes exercised by the data work:* **C3** (honest measurement — split by document, not page; leakage = the
+same scan in two splits), **C15** (data as the lever — curation, deduplication of scans, corpus construction).
+please explain this 
+
+Assistant:
+This snippet describes two specific course concepts, competencies, or evaluation criteria (labeled C3 and C15) that were addressed or demonstrated through the data preparation process.
+
+1. Class C3: Honest Measurement
+Core Idea: Ensuring the machine learning evaluation is fair, realistic, and free of data leakage (cheating unintentionally).
+
+What it means in your project:
+
+"Split by document, not page": If a multi-page document is split randomly page-by-page into training and testing sets, pages from the same document end up in both. Since pages in a single document share identical fonts, layouts, scan artifacts, and handwriting/print styles, the model can memorize those visual characteristics. By splitting full documents into training or testing groups, you force the model to evaluate on completely unseen documents.
+
+"Leakage = the same scan in two splits": Data leakage happens if duplicate images/scans of the same original document exist in both the training set and the test set. If this occurs, the evaluation scores will be artificially inflated because the model is tested on data it already saw during training.
+
+2. Class C15: Data as the Lever
+Core Idea: Focusing performance improvements on the quality and engineering of the dataset itself (Data-Centric AI), rather than just tweaking model algorithms.
+
+What it means in your project:
+
+"Curation, deduplication of scans, corpus construction": The main work here involved cleaning up the raw input data. This includes gathering the text/image corpus, removing exact or near-duplicate document scans (deduplication) so they don't corrupt the splits, and curating the text representations (like converting OCR/page JSONs into structured ground truth) to make the downstream task effective.
+
+
+User: ### Stage 2 — Layout analysis (detection & segmentation)
+Detect and segment the page into regions — text blocks, headings, figures, tables, columns, marginalia —
+so recognition runs on the right pieces in the right order. Optionally model layout as a graph.
+→ **C5** (CNN lineage — the detection backbone), **C16** (ViT for documents; layout-as-graph GNN — the one
+place structured/permutation-aware modeling is native), **C17** (dense prediction & detection — *the core of
+this stage*: segmentation, region proposals, set-prediction).
+What key factors and best practices should I keep in mind when designing layout.py
+
+Assistant:
+When designing layout.py for Stage 2 (Layout Analysis), your goal is to build a robust module that bridges computer vision backbones with structured document representations.
+
+Core Architectural Best Practices
+1. Input/Output Data Contracts
+Explicit Bounding Box & Region Schemas: Define a strict Dataclass or Pydantic model for page elements (Region, LayoutGraph, BBox). Each region should hold bounding box coordinates normalized relative to page dimensions (e.g., [0.0, 1.0]), category labels (heading, text, table, figure, marginalia), confidence scores, and reading-order indices.
+
+Format Flexibility: Design outputs so they can be serialized easily into JSON/JSONL format to feed downstream Stage 3 (Recognition) processes seamlessly.
+
+2. Model Backbone & Core Abstractions
+Backbone Agnosticism (C5, C16): Abstract the detection backbone behind a clean interface (e.g., BaseLayoutDetector). This allows you to swap or benchmark different architectures:
+
+CNN Lineage (C5): Faster R-CNN or Mask R-CNN backbones for fast anchor-based detection.
+
+Vision Transformers / Layout ViTs (C16): Transformer-based vision backbones (e.g., LayoutLMv3, DiT) for complex, multimodal visual features.
+
+Dense Prediction & Set Prediction (C17):
+
+Support region proposals and semantic/instance segmentation masks for non-rectangular or overlapping layout elements.
+
+For set-prediction models (like DETR-based layout analyzers), ensure post-processing cleanly filters low-confidence object queries and handles duplicate detections (NMS/Soft-NMS).
+
+3. Spatial & Reading Order Modeling (Layout as Graph)
+Permutation-Aware Graph Construction (C16):
+
+Represent layout elements as nodes and spatial relationships (e.g., above, below, inside, column-next-to) as edges.
+
+Use spatial heuristics (or a Graph Neural Network / GNN layer) to sort non-linear page elements—such as multi-column layouts, sidebars, and marginalia—into a deterministic, human-like reading order.
+
+Handling Marginalia & Complex Regions: Treat marginalia, headers, and footers as explicit label categories so they can be isolated or excluded during text recognition/merging.
+
+4. Edge-Case Handling & Robustness
+Aspect Ratio & Resolution Handling: Document scans often come in irregular sizes. Ensure pre-processing (scaling, padding) preserves aspect ratios to avoid distorting small text lines and table grids.
+
+Coordinate Mapping: Keep transformation matrices whenever scaling or rotating input pages so predicted bounding boxes map precisely back to the original full-resolution image.
+
+Empty Page / Low-Quality Detection: Include fallback logic for pages with no detectable text blocks, heavy scan artifacts, or low detection confidence.
+
+
+User:### Stage 3 — Text recognition (OCR / HTR)
+Transcribe each region to text. This is the classic **CNN → attention → decoder** arc: a vision encoder reads
+pixels, a sequence model aligns them to characters (CTC or attention), a decoder emits text. Fine-tune a
+pretrained recognizer on the corpus.
+→ **C6–C7** (trainable depth — training the reader; optimizer, LR schedule, init), **C8–C9** (memory over
+time; the encoder-decoder bottleneck; CTC/attention alignment), **C10–C11** (self-attention & the Transformer
+block — modern OCR/HTR, e.g. TrOCR-style).
+What architectural considerations should I keep in mind when designing the structure in ocr.py
+
+Assistant:
+When designing ocr.py for Stage 3 (Text Recognition / HTR), your architectural focus transitions from 2D spatial segmentation to sequence-to-sequence modeling, alignment, and decoding.
+Here are the key architectural factors and best practices to structure ocr.py, aligned with the core competencies of Stage 3:
+Core Architectural Considerations for ocr.py
+1. Decoupling the Model Architecture (CNN vs. ViT vs. CTC/Attention)
+Your module should support both classical hybrid models (CNN + RNN/CTC) and modern end-to-end vision-language transformers (e.g., TrOCR) without requiring changes to downstream call sites.
+Classical Arc (C6–C9): CNN Encoder (ResNet/VGG) $\rightarrow$ RNN/BiLSTM (Sequence modeling) $\rightarrow$ CTC Loss / Attention Decoder.
+Modern Transformer Arc (C10–C11): Vision Transformer (ViT) Encoder $\rightarrow$ Cross-Attention Decoder (e.g., TrOCR, Donut).
+Best Practice: Wrap recognition backbones under a single abstract class or interface (BaseRecognizer). This keeps training loops, LR schedulers, and inference logic uniform.
+2. Alignment & Loss Mechanisms (C8–C9)
+CTC (Connectionist Temporal Classification): Requires frame-by-frame alignment and collapsing duplicate characters (blank token). Highly efficient for line-level recognition, but sensitive to extreme aspect ratio warps.
+Sequence-to-Sequence Attention: Uses cross-attention between visual patch embeddings and target text tokens. Eliminates CTC alignment restrictions but requires strict autoregressive decoding bounds to avoid hallucination loops.
+3. Image Preprocessing & Spatial Normalization
+Historical scan inputs (e.g., Bengali script with top diacritics/matra) require strict batch normalization before entering the vision encoder:
+Aspect-Ratio Preserving Resize: Resizing cropped text line images directly to fixed dimensions ($W \times H$) distorts character shapes. Use fixed-height scaling with dynamic dynamic right-side padding (e.g., height $64\text{px}$, padded width $512\text{px}$).
+Binarization & Contrast Augmentation: Add hooks for adaptive thresholding or grayscale normalization to handle faded historical inks.
+4. Gold Alignment & Fallback Logic (Fuzzy Tier Allocation)
+When aligning raw OCR predictions to human ground-truth (Gold) annotations:
+Avoid Rigid Line Matching: Rather than requiring exact equal line counts between layout boxes and gold text lines, use fuzzy alignment (e.g., SequenceMatcher or Levenshtein edit distance).
+Tier Assignment: Assign matching lines to the "gold" tier and unmatched or low-confidence predictions gracefully to the "raw" (ungated) tier, preventing whole-page failures.
+
+User: I am working on a Deep-Learning project called 'Decoding the Archives,' which involves building an Agentic-RAG system for Bengali-medium literature education. My corpus consists of scanned pages from Rabindra Rachanabali, Volume 25. My primary non-functional requirement (NFR) is Explainability, meaning I must be able to cite specific page and line IDs for every answer provided to students.
+In Stage 2 (Layout Detection), I am using Tesseract-ben with the configuration `--oem 1 --psm 3`. My exploration showed that the corpus is predominantly single-column, but it has significant literary formatting variations, such as centered poetry stanzas, indented verse, and right-aligned drama tags like `[ প্রস্থান`. I am using `pytesseract.image_to_data` to extract regions, and I must adhere to a fixed data contract where `detect()` returns a `list[Region]`
+I need to sort my detected regions by reading order to ensure the literary flow of Tagore's work is preserved. How can I ensure that the (block\_num, par\_num, line\_num) grouping from Tesseract's image\_to\_data output correctly preserves the top-to-bottom sequence of prose and poetry?
+Specifically, if Tesseract identifies a centered heading or an indented poem stanza as a separate 'block,' will sorting by these keys numerically still result in a natural reading order, or do I need to implement a secondary sorting logic based on the `top` (y-coordinate) pixel values to handle the vertical flow across different blocks?
+
+Assistant:
+Yes — **you should use the Tesseract hierarchy as the primary grouping mechanism, but you should not rely on `(block_num, par_num, line_num)` alone to establish the final literary reading order.** For your corpus, a secondary spatial sort using the `top`/`y` coordinate is safer.
+
+### Why
+
+`image_to_data()` gives you two different kinds of information:
+
+* **Structural hierarchy**
+
+  * `block_num`
+  * `par_num`
+  * `line_num`
+  * `word_num`
+* **Physical position**
+
+  * `left`
+  * `top`
+  * `width`
+  * `height`
+
+The important distinction is that **`block_num` is an OCR segmentation identifier, not a semantic reading-order guarantee**.
+
+For example, imagine a page like:
+
+```text
+              কবিতা
+
+      প্রথম পঙ্‌ক্তি
+      দ্বিতীয় পঙ্‌ক্তি
+
+              তৃতীয় পঙ্‌ক্তি
+
+                           [প্রস্থান
+```
+
+Tesseract might produce separate blocks:
+
+```text
+block 1 → কবিতা
+block 2 → প্রথম পঙ্‌ক্তি / দ্বিতীয় পঙ্‌ক্তি
+block 3 → তৃতীয় পঙ্‌ক্তি
+block 4 → [প্রস্থান
+```
+
+The fact that Tesseract assigns them `block_num = 1, 2, 3, 4` **does not mean you should treat those numbers as the canonical spatial reading order**.
+
+In particular, centered and indented text can cause Tesseract's layout analysis to create blocks in ways that don't perfectly correspond to the literary flow.
+
+### Recommended approach
+
+Since your corpus is predominantly **single-column**, use a **top-to-bottom spatial ordering at the block/region level**.
+
+Conceptually:
+
+```python
+regions.sort(key=lambda r: (r.top, r.left))
+```
+
+But there is an important improvement: **don't sort individual words purely by `top`**. First construct your `Region` objects from Tesseract's hierarchy, then sort the resulting regions.
+
+A good pipeline is:
+
+```text
+Tesseract image_to_data
+        ↓
+group words
+        ↓
+(block_num, par_num, line_num)
+        ↓
+construct Region
+        ↓
+calculate Region bounding box
+        ↓
+sort Regions spatially
+        ↓
+reading order
+```
+
+For each region, calculate:
+
+```text
+region.top    = minimum(word.top)
+region.bottom = maximum(word.top + word.height)
+region.left   = minimum(word.left)
+region.right  = maximum(word.left + word.width)
+```
+
+Then use the vertical position to establish the page flow.
+
+### However, don't blindly use `(top, left)`
+
+There is a subtle problem with poetry.
+
+Suppose two lines belong to the same stanza:
+
+```text
+          তুমি রবে নীরবে
+     হৃদয়ে মম জীবনভরা
+```
+
+Their `top` values naturally differ, while their horizontal positions differ because of indentation/centering.
+
+That's fine **if your Region represents the entire stanza/block**.
+
+So I would recommend making the Tesseract block your initial region boundary:
+
+```python
+(block_num, par_num)
+```
+
+or, depending on your `Region` contract, grouping at the block level and preserving the lines inside that block.
+
+Then:
+
+```python
+regions.sort(key=lambda r: (r.top, r.left))
+```
+
+This handles:
+
+* centered headings
+* indented poetry
+* normally aligned prose
+* right-aligned drama directions
+
+without treating horizontal alignment as a change in reading sequence.
+
+---
+
+## The key point for your project
+
+I would **not discard `block_num`**.
+
+Instead, use the two signals for different purposes:
+
+| Information | Use                                                                    |
+| ----------- | ---------------------------------------------------------------------- |
+| `block_num` | Identify/group OCR regions                                             |
+| `par_num`   | Preserve paragraph structure                                           |
+| `line_num`  | Preserve lines within a paragraph/block                                |
+| `top`       | Establish vertical reading order between regions                       |
+| `left`      | Resolve regions that occur at approximately the same vertical position |
+
+So your ordering should conceptually be:
+
+```python
+# First: construct regions from Tesseract hierarchy
+
+regions = build_regions(data)
+
+# Then: spatial reading order
+regions.sort(key=lambda r: (r.top, r.left))
+```
+
+rather than:
+
+```python
+regions.sort(
+    key=lambda r: (r.block_num, r.par_num, r.line_num)
+)
+```
+
+### One more safeguard: vertical overlap
+
+For a robust implementation, especially because you have drama tags such as:
+
+```text
+                         [ প্রস্থান
+```
+
+you can define a **same-row tolerance**.
+
+For example, two regions whose vertical centers differ by only a small amount can be considered part of the same horizontal band:
+
+```python
+center_y = top + height / 2
+```
+
+Then conceptually:
+
+```python
+if abs(region_a.center_y - region_b.center_y) < Y_TOLERANCE:
+    # same horizontal band → sort left-to-right
+else:
+    # different vertical bands → top-to-bottom
+```
+
+This gives you:
+
+```text
+top → bottom
+       ↓
+same vertical band → left → right
+```
+
+rather than depending on Tesseract's block numbering.
+
+---
+
+## What I would use for your NFR
+
+Because your **Explainability NFR requires page + line IDs**, I would preserve the original Tesseract hierarchy rather than replacing it with a purely geometric representation.
+
+Your `Region` could internally retain something like:
+
+```text
+Region
+ ├── page_id
+ ├── block_num
+ ├── par_num
+ ├── line_num
+ ├── text
+ ├── left
+ ├── top
+ ├── width
+ └── height
+```
+
+Then your final canonical ordering becomes:
+
+```text
+Spatial order
+    ↓
+Region
+    ↓
+Tesseract line IDs
+    ↓
+page_id + line_id
+    ↓
+RAG citation
+```
+
+That is much better for your Agentic-RAG system because **layout detection determines reading order, while the original Tesseract identifiers remain available for provenance/citation.**
+
+### Bottom line
+
+**Do not assume numerical `(block_num, par_num, line_num)` ordering is the correct literary reading order.**
+
+For your predominantly single-column Rabindra Rachanabali corpus, I recommend:
+
+> **Tesseract hierarchy for grouping + bounding-box `top`/`left` for final spatial ordering.**
+
+And because your corpus contains centered poetry, indentation, and right-aligned drama directions, **the `top` coordinate is particularly important**. Horizontal position should normally be a secondary tie-breaker, not the primary ordering criterion.
+
+This approach also fits your fixed contract nicely: `detect()` can still return exactly `list[Region]`; the additional ordering logic stays entirely inside `detect()` and does not require changing the interface.
+
+
+User: Uploaded layout.py for checking
+
+Assistant:
+Yes — **the overall design is good and it addresses the main problem we discussed**: you are no longer trusting Tesseract's `(block_num, par_num, line_num)` numbering as the reading order. You're using those IDs for provenance and using spatial coordinates for ordering.
+
+However, I would make **two important changes** before considering this production-ready.
+
+### 1. Your core architecture is correct
+
+This part is exactly what I would keep:
+
+```text
+image_to_data()
+      ↓
+group words by (block_num, par_num, line_num)
+      ↓
+create line-level regions
+      ↓
+calculate bbox / center_y
+      ↓
+spatial reading-order sort
+      ↓
+return list[Region]
+      +
+layout_meta.jsonl for provenance
+```
+
+This is especially appropriate for your corpus because you already established that Volume 25 is predominantly single-column.
+
+Your use of:
+
+```python
+key = (
+    data["block_num"][i],
+    data["par_num"][i],
+    data["line_num"][i],
+)
+```
+
+is therefore **correct for identifying a Tesseract line**, but not for deciding its final page order.
+
+And this:
+
+```python
+by_y = sorted(lines, key=lambda ln: ln["center_y"])
+```
+
+is the right basic idea.
+
+---
+
+# 2. I would change your Y-band implementation slightly
+
+This is the main thing I'd be careful about:
+
+```python
+band_ref_y = sum(b["center_y"] for b in bands[-1]) / len(bands[-1])
+```
+
+You're continuously moving the band's reference point.
+
+That creates a **chaining effect**.
+
+For example, with `y_tolerance = 5`:
+
+```text
+line A: y = 100
+line B: y = 104
+line C: y = 108
+```
+
+Your algorithm can potentially put all three in the same band:
+
+```text
+100 → 104 → 108
+```
+
+even though:
+
+```text
+abs(108 - 100) = 8 > 5
+```
+
+That could theoretically merge two actual literary lines into the same horizontal band.
+
+For your corpus, I would make the band reference more stable.
+
+For example:
+
+```python
+def _spatial_reading_order(
+    lines: list[dict],
+    y_tolerance: float,
+) -> list[dict]:
+    if not lines:
+        return []
+
+    by_y = sorted(lines, key=lambda ln: ln["center_y"])
+
+    bands: list[list[dict]] = []
+    band_ref_y: float | None = None
+
+    for ln in by_y:
+        if (
+            band_ref_y is None
+            or abs(ln["center_y"] - band_ref_y) > y_tolerance
+        ):
+            bands.append([ln])
+            band_ref_y = ln["center_y"]
+        else:
+            bands[-1].append(ln)
+
+    ordered: list[dict] = []
+
+    for band in bands:
+        band.sort(key=lambda ln: ln["x0"])
+        ordered.extend(band)
+
+    return ordered
+```
+
+Notice that I **don't update `band_ref_y`**.
+
+That means a band represents a genuine vertical neighborhood around its first line rather than a potentially expanding cluster.
+
+---
+
+# 3. One conceptual issue: don't interpret every band as a "row"
+
+Your comment currently says:
+
+> Lines whose vertical centers fall within `y_tolerance` of each other are treated as the same horizontal band (row)
+
+That's okay, but remember that your corpus is **primarily single-column**.
+
+You aren't actually trying to reconstruct a newspaper-style 2D reading order.
+
+Your actual objective is:
+
+```text
+vertical literary flow
+        ↓
+top → bottom
+        ↓
+if two regions genuinely occupy the same horizontal level:
+        ↓
+left → right
+```
+
+That's a much better description of what your algorithm is doing.
+
+---
+
+# 4. Your handling of centered poetry is good
+
+Suppose Tesseract detects:
+
+```text
+             রবীন্দ্রনাথ
+
+        আজি হতে শতবর্ষ পরে
+       কে তুমি পড়িছ আমার এই
+             কবিতাখানি
+```
+
+and creates separate blocks.
+
+You don't care that:
+
+```text
+heading → block 1
+poem    → block 2
+```
+
+or perhaps Tesseract assigns them differently.
+
+You calculate:
+
+```text
+heading center_y = 200
+line 1   center_y = 250
+line 2   center_y = 270
+line 3   center_y = 290
+```
+
+and therefore get:
+
+```text
+heading
+line 1
+line 2
+line 3
+```
+
+even if the poem is centered or indented.
+
+**That's exactly what you want.**
+
+---
+
+# 5. Your right-aligned `[ প্রস্থান` case is also reasonable
+
+Suppose:
+
+```text
+আমি চলিলাম                         [ প্রস্থান
+```
+
+Both are on approximately the same Y level.
+
+Your algorithm does:
+
+```python
+band.sort(key=lambda ln: ln["x0"])
+```
+
+so it produces:
+
+```text
+আমি চলিলাম
+                                [ প্রস্থান
+```
+
+which is a sensible reading order for a predominantly single-column literary page.
+
+And importantly, you're not doing something dangerous like:
+
+```python
+sorted(lines, key=lambda x: x["x0"])
+```
+
+which would completely destroy the vertical flow.
+
+So:
+
+```text
+Y = primary
+X = secondary
+```
+
+is the correct principle.
+
+---
+
+# 6. Your provenance design is particularly good
+
+This part is important for your **Explainability NFR**.
+
+You preserve:
+
+```json
+{
+    "region_id": "..._r003",
+    "page_id": "...",
+    "bbox": [...],
+    "block_num": 2,
+    "par_num": 1,
+    "line_num": 4
+}
+```
+
+while keeping the required:
+
+```python
+detect(...) -> list[Region]
+```
+
+contract unchanged.
+
+That's a good separation:
+
+```text
+Region
+   ↓
+stable pipeline object
+
+layout_meta.jsonl
+   ↓
+Tesseract provenance
+```
+
+I would definitely keep this architecture.
+
+It means later you can say:
+
+```text
+Answer claim
+    ↓
+retrieved chunk
+    ↓
+page_id
+    ↓
+region_id
+    ↓
+Tesseract block/par/line
+    ↓
+original scanned page
+```
+
+which is much more defensible for your RAG explainability requirement.
+
+---
+
+# 7. One thing I would change in the documentation
+
+Your docstring says:
+
+> centered poetry heading or a right-aligned stage direction (e.g. '[ প্রস্থান') sharing a row with body text still come out in a sensible left-to-right order
+
+I would slightly soften that claim.
+
+The algorithm **does not know that something is a heading, poem, or stage direction**.
+
+It only knows:
+
+```text
+Y position
+X position
+```
+
+So the claim should be more like:
+
+> Regions occupying approximately the same vertical band are ordered left-to-right, while vertically separated regions are ordered top-to-bottom. This preserves the expected reading flow for the corpus's predominantly single-column pages, including indented/centered literary text and right-aligned stage directions.
+
+That's technically more accurate.
+
+---
+
+# 8. Also check these syntax issues
+
+If the code you pasted is literally what is in the `.py` file, these need fixing:
+
+```python
+from **future** import annotations
+```
+
+should be:
+
+```python
+from __future__ import annotations
+```
+
+Likewise:
+
+```python
+from ..contracts import \*
+```
+
+should be:
+
+```python
+from ..contracts import *
+```
+
+and:
+
+```python
+logger = get_logger(**name**)
+```
+
+should be:
+
+```python
+logger = get_logger(__name__)
+```
+
+I'm assuming those `**`/`\*` sequences are just formatting artifacts from pasting the code here. If they're actually in the source file, Python will reject them.
+
+---
+
+## My verdict
+
+**Yes, this is fundamentally the right implementation.** I would classify it as:
+
+| Component                                       | Assessment          |
+| ----------------------------------------------- | ------------------- |
+| Tesseract `image_to_data()`                     | ✅                   |
+| `(block, paragraph, line)` grouping             | ✅                   |
+| Preserve Tesseract provenance                   | ✅                   |
+| `list[Region]` contract                         | ✅                   |
+| Y-based ordering                                | ✅                   |
+| X as secondary ordering                         | ✅                   |
+| Dynamic Y tolerance                             | ✅                   |
+| Sidecar provenance                              | ✅                   |
+| Suitable for predominantly single-column corpus | ✅                   |
+| Current moving Y-band reference                 | ⚠️ Change           |
+| Reliance on block numbers for reading order     | ❌ Avoided correctly |
+
+The **most important conceptual statement for your Stage 2 design** is:
+
+> **Tesseract's `(block_num, par_num, line_num)` identifies and groups OCR content, but spatial coordinates determine canonical reading order.**
+
+That is the distinction your current implementation captures, and it is the right one for the Bengali literary corpus you've described.
+
+
+User: Uploaded layout.py again after some modifications
+
+Assistant:
+Yes — from the algorithm/design perspective, you're good to go. The important changes we discussed are now in place.
+
+What is now correct
+
+Your pipeline is doing the right separation of responsibilities:
+
+Tesseract
+   │
+   ├── (block_num, par_num, line_num)
+   │        ↓
+   │    identify/group lines
+   │
+   └── bounding boxes
+            ↓
+       center_y / x0
+            ↓
+       spatial ordering
+            ↓
+       canonical reading order
+
+So a centered heading, indented stanza, or right-aligned [ প্রস্থান does not depend on Tesseract's block numbering to determine where it appears in the final sequence.
+
+Your final ordering is:
+
+Y first → X second
+
+which is appropriate for your predominantly single-column corpus.
+
+Your provenance sidecar is also correctly preserved:
+
+{
+  "region_id": "..._r003",
+  "page_id": "...",
+  "bbox": [...],
+  "block_num": 2,
+  "par_num": 1,
+  "line_num": 4
+}
+
+That is particularly important because your Region contract cannot carry the Tesseract IDs.
+
+One thing to verify before running
+
+In the code you've pasted, I still see:
+
+from **future** import annotations
+
+and:
+
+logger = get_logger(**name**)
+
+and:
+
+from ..contracts import \*
+
+If those are just escaping/formatting artifacts from ChatGPT's display, ignore this.
+
+If they are literally in your Python file, they must be:
+
+from __future__ import annotations
+from ..contracts import *
+
+and:
+
+logger = get_logger(__name__)
+
+Also make sure your actual function names contain normal underscores, e.g.:
+
+def _tess_config(...)
+def _group_words_into_lines(...)
+def _y_tolerance(...)
+def _spatial_reading_order(...)
+One small technical caveat
+
+Your fixed-band algorithm is now much better than the previous moving-reference version:
+
+if band_ref_y is None or abs(ln["center_y"] - band_ref_y) > y_tolerance:
+    bands.append([ln])
+    band_ref_y = ln["center_y"]
+else:
+    bands[-1].append(ln)
+
+I would keep it as-is for now rather than making it more complicated.
+
+Why? Your corpus is predominantly single-column, so you don't need a sophisticated general-purpose document-layout algorithm. Over-engineering this stage could actually make the behavior harder to explain and validate.
+
+Final verdict
+
+Yes, proceed with this implementation. ✅
+
+Your Stage 2 now satisfies the important requirements:
+
+✅ detect() still returns list[Region]
+✅ Tesseract --oem 1 --psm 3 is preserved
+✅ Tesseract hierarchy is retained for provenance
+✅ Tesseract block numbering is not treated as reading order
+✅ Reading order is spatially determined
+✅ Y coordinate is primary
+✅ X coordinate is secondary
+✅ Centered/indented literary text is supported
+✅ Right-aligned drama directions are supported
+✅ Per-page adaptive Y tolerance
+✅ Provenance written to layout_meta.jsonl
+✅ region_id corresponds to the returned region order
+✅ Suitable for your explainability requirement
+
+The next thing I'd do is test this against a small set of actual Volume 25 pages containing prose + centered poetry + indentation + [ প্রস্থান, rather than changing the algorithm further. If those cases produce the expected region_id sequence, Stage 2 can be considered stable.
+
+User: I am working on filling the stubs in `src/doc_agent/vision/ocr.py` for my Stage 3 implementation. Since my Stage 2 layout detector already supplies line-level bounding boxes (`Region` objects), I need to implement `transcribe_region` in the `Reader` class.
+
+Two technical aspects need clarification for optimal OCR performance on Rabindra Rachanabali (Volume 25):
+
+1. How should I configure `pytesseract.image_to_string` using `--oem 1 --psm 7` (single text line mode) specifically tuned for Bengali script (`-l ben`) to prevent line-wrapping artifacts?
+2. Bengali script features top hanging lines (*matras*), ascenders, and complex subscript conjuncts (*jofala*, *rafala*). Should I add a small pixel padding (e.g., 3–5 px) around the Stage 2 bounding box before cropping the image, and what edge-clipping issues might occur if I pass the raw tight crop directly to Tesseract?
+
+Assistant :
+Yes. Given your Stage 2 contract—**one `Region` = one detected text line**—`transcribe_region()` should treat each crop as a **single Bengali text line**, so `--psm 7` is appropriate.
+
+### 1. Tesseract configuration
+
+Use:
+
+```python
+config = "--oem 1 --psm 7"
+text = pytesseract.image_to_string(crop, lang="ben", config=config)
+```
+
+The roles are:
+
+* `-l ben` → Bengali trained data.
+* `--oem 1` → LSTM OCR engine.
+* `--psm 7` → tells Tesseract to assume the image contains **one text line**.
+
+This is preferable to `--psm 3` at Stage 3 because Stage 2 has already done the segmentation. You don't want Tesseract trying to rediscover paragraphs/blocks/layout inside an already isolated line.
+
+Importantly, **`--psm 7` doesn't itself prevent text wrapping**. The main reason wrapping/layout artifacts should disappear is that your input is already a single-line crop. `psm 7` simply tells Tesseract to interpret that crop as one line.
+
+I would therefore keep the OCR configuration simple rather than adding aggressive page-segmentation options.
+
+---
+
+### 2. Add padding around the Stage 2 bbox
+
+**Yes — add a small padding.** For your Bengali corpus, I would start with **3–5 pixels on each side**, with **4 px** as a reasonable default.
+
+Conceptually:
+
+```text
+Stage 2 bbox
+┌───────────────────────────────┐
+│        Bengali text           │
+└───────────────────────────────┘
+
+             ↓ padding
+
+┌───────────────────────────────────┐
+│                                   │
+│        Bengali text               │
+│                                   │
+└───────────────────────────────────┘
+```
+
+This matters because a tight bounding box can cut into glyph components.
+
+Bengali's **matra** is particularly important here. If the top of a glyph touches the crop boundary, you can lose part of the horizontal headline or upper glyph structure. Similarly, lower portions of conjuncts and forms involving **jofala/rafala** can approach the bottom boundary.
+
+A crop like:
+
+```text
+┌───────────────┐
+│────────────── │  ← matra touches boundary
+│   বাংলা       │
+└───────────────┘
+```
+
+is less desirable than:
+
+```text
+┌────────────────┐
+│                │
+│ ─────────────  │
+│    বাংলা       │
+│                │
+└────────────────┘
+```
+
+The padding gives Tesseract some surrounding pixels and reduces the chance of **edge-clipping** changing the glyph shape.
+
+---
+
+### 3. Don't assume padding is always exactly 4 px
+
+The important point is that the padding should be applied **after clamping the bbox to the image boundaries**.
+
+For an image of:
+
+```text
+width = W
+height = H
+```
+
+and a Stage 2 bounding box:
+
+```text
+x, y, w, h
+```
+
+do:
+
+```python
+pad = 4
+
+x0 = max(0, x - pad)
+y0 = max(0, y - pad)
+x1 = min(W, x + w + pad)
+y1 = min(H, y + h + pad)
+
+crop = image[y0:y1, x0:x1]
+```
+
+This is important for lines near the top/bottom/left/right edge of a scanned page. You cannot simply subtract 4 from `x`/`y` without checking the page boundary.
+
+---
+
+### 4. One thing I would **not** do
+
+Don't enlarge the padding dramatically just because Bengali has complex glyphs.
+
+For example, I would **not immediately use 15–20 px**.
+
+Too much surrounding whitespace can make the single-line segmentation less clean and can introduce neighboring text into the OCR crop, particularly when two lines are close together.
+
+Start with:
+
+```python
+pad = 4
+```
+
+and make it configurable:
+
+```python
+pad = cfg.get("ocr", {}).get("crop_padding_px", 4)
+```
+
+Then you can empirically compare 0, 2, 4, 6 px on your Volume 25 validation pages.
+
+---
+
+### Recommended `transcribe_region()` behavior
+
+Your Stage 3 flow should essentially be:
+
+```text
+Stage 2 Region
+      │
+      ▼
+extract bbox
+      │
+      ▼
+expand bbox by ~4 px
+      │
+      ▼
+clamp to image dimensions
+      │
+      ▼
+crop
+      │
+      ▼
+Tesseract
+--oem 1 --psm 7
+-l ben
+      │
+      ▼
+strip whitespace
+      │
+      ▼
+transcribed line
+```
+
+So the core implementation can remain very small:
+
+```python
+config = "--oem 1 --psm 7"
+text = pytesseract.image_to_string(
+    crop,
+    lang="ben",
+    config=config,
+)
+return text.strip()
+```
+
+### Bottom line
+
+For your **Stage 2 → Stage 3 architecture**, I recommend:
+
+**Stage 2**
+
+```text
+PSM 3
+↓
+layout detection
+↓
+line-level Region
+```
+
+**Stage 3**
+
+```text
+Region bbox
+↓
+~4 px padding + boundary clamp
+↓
+PSM 7
+↓
+Bengali OCR (-l ben)
+```
+
+That is a much cleaner separation of responsibilities than asking Stage 3's Tesseract invocation to perform layout analysis again.
+
+
+User: Now that our single-line OCR cropping strategy (--psm 7 with 4px boundary-clamped padding) is established for Stage 3, I am implementing Stage 3 OCR in `src/doc_agent/vision/ocr.py` to satisfy my **E26 Data Specialty** requirements (Rabindra Rachanabali Volume 25).
+We need to add a "Silver-Label Quality Gate" that compares our Tesseract single-line OCR output against the Internet Archive reference text to discard corrupted or noisy lines before indexing.
+About CER, I want to understand how should we measure the difference between our OCR hypothesis string and the reference text?
+
+
+Assistant:
+Yes. For your **Silver-Label Quality Gate**, CER is a very appropriate metric because you are comparing the OCR hypothesis against a reference transcription **at character level**, which is particularly useful for Bengali OCR.
+
+## 1. What CER measures
+
+Let:
+
+* **Reference** = the Internet Archive transcription, i.e. what the line should say.
+* **Hypothesis** = your Tesseract `--psm 7 -l ben` output.
+
+CER is:
+
+[
+\boxed{
+CER = \frac{S + D + I}{N}
+}
+]
+
+where:
+
+* (S) = substitutions — wrong character
+* (D) = deletions — OCR missed a character
+* (I) = insertions — OCR added an extra character
+* (N) = number of characters in the reference
+
+This is essentially **Levenshtein edit distance divided by the reference length**.
+
+### Example
+
+Reference:
+
+```text
+আমার সোনার বাংলা
+```
+
+OCR:
+
+```text
+আমার শোনার বাংলা
+```
+
+Suppose one character is substituted:
+
+```text
+স → শ
+```
+
+Then:
+
+[
+CER = \frac{1}{16}
+]
+
+approximately `0.0625`, or **6.25%**.
+
+Lower CER is better:
+
+```text
+CER = 0.00   → exact match
+CER = 0.05   → very small difference
+CER = 0.20   → substantial errors
+CER = 1.00   → edit distance equals reference length
+```
+
+CER can even exceed `1.0` if there are many insertions.
+
+---
+
+# 2. For your Bengali corpus, don't calculate CER on raw strings
+
+This is the **most important consideration** for your implementation.
+
+Internet Archive OCR and Tesseract may differ in harmless formatting even when the actual literary text is identical.
+
+For example:
+
+```text
+Reference:
+আমার  সোনার  বাংলা
+
+Tesseract:
+আমার সোনার বাংলা
+```
+
+A raw character-level comparison would count the additional whitespace as errors.
+
+Likewise:
+
+```text
+Reference:
+আমার সোনার বাংলা।
+
+Tesseract:
+আমার সোনার বাংলা
+```
+
+might produce a difference even though the OCR content is essentially correct.
+
+So you should distinguish between:
+
+```text
+raw OCR text
+        ↓
+normalization
+        ↓
+CER comparison
+```
+
+rather than directly:
+
+```text
+raw OCR ↔ raw IA
+```
+
+---
+
+# 3. Recommended normalization for your Silver Gate
+
+I would use **conservative normalization**.
+
+You don't want to "fix" Bengali OCR before measuring it, because that could artificially lower the CER.
+
+At minimum, normalize:
+
+### Whitespace
+
+Convert runs of whitespace to one space:
+
+```text
+"আমার   সোনার   বাংলা"
+        ↓
+"আমার সোনার বাংলা"
+```
+
+Strip leading/trailing whitespace.
+
+### Unicode normalization
+
+Use Unicode NFC:
+
+```python
+unicodedata.normalize("NFC", text)
+```
+
+This is useful because visually equivalent Unicode representations can otherwise produce different character sequences.
+
+So conceptually:
+
+```python
+def normalize_for_cer(text):
+    text = unicodedata.normalize("NFC", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+```
+
+I would **not initially remove Bengali punctuation, matras, conjunct components, or Bengali characters**. Those are precisely the things your OCR system needs to get right.
+
+---
+
+# 4. Character means Unicode characters, not bytes
+
+For Bengali, this matters.
+
+Do **not** calculate CER based on:
+
+```python
+len(text.encode("utf-8"))
+```
+
+That would count UTF-8 bytes.
+
+Instead, operate on Python Unicode strings:
+
+```python
+len(reference)
+```
+
+after your normalization.
+
+However, there is an additional Bengali-specific issue: Unicode grapheme composition.
+
+For example, Bengali characters can involve:
+
+```text
+consonant + virama + consonant
+consonant + vowel sign
+conjunct combinations
+```
+
+So for your first implementation, **NFC normalization + Unicode-character-level CER** is a reasonable and reproducible definition.
+
+You can later investigate grapheme-cluster CER if your evaluation shows that Unicode code-point CER is too sensitive to particular Bengali compositions.
+
+---
+
+# 5. How the quality gate should work
+
+Your Stage 3 pipeline could become:
+
+```text
+Stage 2 Region
+       ↓
+4 px padded crop
+       ↓
+Tesseract --oem 1 --psm 7 -l ben
+       ↓
+OCR hypothesis
+       ↓
+normalize
+       │
+       ├───────────────┐
+       ↓               ↓
+IA reference       OCR hypothesis
+       │               │
+       └───────┬───────┘
+               ↓
+             CER
+               ↓
+       Silver-Label Gate
+          /          \
+       PASS          FAIL
+        ↓             ↓
+   keep line       discard line
+        ↓
+     indexing
+```
+
+The crucial point is:
+
+> **CER should be calculated before deciding whether the OCR line is trustworthy enough to enter your indexed corpus.**
+
+---
+
+# 6. Choosing the threshold
+
+You should **not arbitrarily choose something like `CER < 0.20` and call it scientifically justified**.
+
+Instead, make the threshold configurable:
+
+```yaml
+ocr:
+  silver_label:
+    enabled: true
+    max_cer: 0.20
+```
+
+Then determine the appropriate value empirically using your Volume 25 validation material.
+
+For example, evaluate a representative sample:
+
+|       CER | Interpretation            |
+| --------: | ------------------------- |
+|      0.00 | Exact after normalization |
+| 0.01–0.05 | Very high agreement       |
+| 0.05–0.10 | Generally strong          |
+| 0.10–0.20 | Moderate errors           |
+|    > 0.20 | Increasingly noisy        |
+|    > 0.30 | Likely problematic        |
+
+These are **useful starting ranges, not universal correctness thresholds**.
+
+For your project, you can compare several thresholds:
+
+```text
+0.05
+0.10
+0.15
+0.20
+0.25
+```
+
+and inspect how many lines are retained versus how many visibly corrupted lines remain.
+
+---
+
+# 7. One very important issue: matching the correct IA reference line
+
+CER is only meaningful if:
+
+```text
+Tesseract line
+        ↕
+correct IA line
+```
+
+are actually corresponding lines.
+
+You should **not simply compare Tesseract region #17 with IA line #17** unless you have established that the two sources have identical line segmentation.
+
+Your Stage 2 output might contain:
+
+```text
+Tesseract:
+Region 17 → one line
+Region 18 → one line
+```
+
+while IA's OCR could have:
+
+```text
+IA:
+line 17 → part of line
+line 18 → remainder
+```
+
+or vice versa.
+
+That would make the CER meaningless even though both transcriptions are correct.
+
+So the reference-alignment step is actually a separate problem:
+
+```text
+page
+ ↓
+IA reference text
+ ↓
+reference line segmentation/alignment
+ ↓
+Tesseract Region ↔ reference line
+ ↓
+CER
+```
+
+For your **Silver-Label Quality Gate**, I would explicitly document this assumption.
+
+---
+
+# 8. What I recommend storing
+
+Since your project emphasizes explainability, don't just store:
+
+```text
+PASS / FAIL
+```
+
+Store the quality information in your OCR metadata.
+
+For example:
+
+```json
+{
+  "region_id": "page025_r017",
+  "ocr_text": "আমার সোনার বাংলা",
+  "reference_text": "আমার সোনার বাংলা",
+  "cer": 0.0,
+  "silver_label": "pass"
+}
+```
+
+For a bad line:
+
+```json
+{
+  "region_id": "page025_r018",
+  "ocr_text": "আমার শনার বাংলা",
+  "reference_text": "আমার সোনার বাংলা",
+  "cer": 0.0625,
+  "silver_label": "pass"
+}
+```
+
+And if:
+
+```text
+CER = 0.37
+```
+
+you could record:
+
+```json
+{
+  "cer": 0.37,
+  "silver_label": "reject"
+}
+```
+
+This gives you an audit trail for **why a line was excluded from indexing**.
+
+---
+
+## The important distinction for your project
+
+There are actually **three different text representations** worth maintaining:
+
+```text
+1. Raw Tesseract output
+       ↓
+2. Normalized text
+       ↓
+3. Indexed text
+```
+
+And separately:
+
+```text
+IA reference
+       ↓
+normalized reference
+```
+
+Then:
+
+```text
+normalized Tesseract
+          ↕
+     CER comparison
+          ↕
+normalized IA
+```
+
+**Don't overwrite the raw OCR output with the normalized version.**
+
+The raw output is valuable for debugging your OCR pipeline, while the normalized version is appropriate for evaluation/indexing.
+
+### Recommended definition for your Stage 3
+
+For your implementation, I'd define the Silver-Label gate as:
+
+> **A Tesseract line is accepted as a silver-label transcription only when its normalized Unicode character error rate (CER) against the correctly aligned, normalized Internet Archive reference line is at or below a configurable threshold.**
+
+That gives you a clean, reproducible E26 quality-control mechanism rather than simply relying on Tesseract's own confidence score.
+
+
+User: We need to track metadata for every line (such as ocr_confidence, computed CER, evidence_tier like "gold"/"silver"/"raw", and whether a line was accepted or rejected).
+
+However, I noticed that contracts.Chunk in src/doc_agent/contracts.py is strictly locked by our test suite (test_structure.py), so I cannot add extra fields to the Chunk dataclass.
+
+How should I handle storing and persisting this extra line-level OCR metadata and audit log for rejected lines without modifying contracts.py or polluting our clean search index? What design pattern or metadata strategy should we use in ocr.py?
+
+Assistant:
+Yes. Given that `contracts.Chunk` is a **locked public contract**, the clean solution is to use a **sidecar metadata/audit pattern** rather than putting OCR-quality metadata into `Chunk`.
+
+You already used this pattern successfully in Stage 2 with `layout_meta.jsonl`, so Stage 3 should follow the same architectural principle.
+
+## Recommended design
+
+Keep three things separate:
+
+```text
+                    Stage 3 OCR
+                         │
+              ┌──────────┴──────────┐
+              │                     │
+         accepted lines        rejected lines
+              │                     │
+              ▼                     ▼
+       Chunk / search index    OCR audit sidecar
+              │                     │
+              └──────────┬──────────┘
+                         │
+                   OCR metadata
+```
+
+### 1. `Chunk` remains untouched
+
+Do **not** add:
+
+```python
+ocr_confidence
+cer
+evidence_tier
+accepted
+```
+
+to `Chunk`.
+
+The `Chunk` should continue containing only the fields required by the indexing/retrieval pipeline.
+
+This keeps:
+
+```text
+contracts.py
+     ↓
+stable public interface
+```
+
+while OCR-specific information remains an implementation concern of Stage 3.
+
+---
+
+# 2. Create an OCR sidecar
+
+I would use something like:
+
+```text
+data/processed/
+├── layout_meta.jsonl
+├── ocr_meta.jsonl
+└── ocr_rejected.jsonl
+```
+
+### `ocr_meta.jsonl`
+
+One record for **every processed line**, including accepted and rejected lines:
+
+```json
+{
+  "region_id": "page025_r017",
+  "page_id": "page025",
+  "bbox": [120, 450, 830, 42],
+  "ocr_confidence": 91.4,
+  "cer": 0.034,
+  "evidence_tier": "silver",
+  "accepted": true,
+  "ocr_text": "আমার সোনার বাংলা",
+  "reference_text": "আমার সোনার বাংলা"
+}
+```
+
+For a rejected line:
+
+```json
+{
+  "region_id": "page025_r018",
+  "page_id": "page025",
+  "bbox": [120, 510, 830, 45],
+  "ocr_confidence": 48.2,
+  "cer": 0.37,
+  "evidence_tier": "raw",
+  "accepted": false,
+  "reject_reason": "cer_above_threshold",
+  "ocr_text": "আমার শনর বাংলা"
+}
+```
+
+This gives you a complete audit trail.
+
+---
+
+# 3. Why I prefer one complete `ocr_meta.jsonl`
+
+You could have only:
+
+```text
+ocr_rejected.jsonl
+```
+
+but I recommend keeping **all lines in the primary OCR metadata sidecar**.
+
+That gives you:
+
+```text
+ocr_meta.jsonl
+    │
+    ├── accepted = true
+    └── accepted = false
+```
+
+and optionally maintain:
+
+```text
+ocr_rejected.jsonl
+```
+
+as a convenient audit-only file.
+
+The second file is technically redundant, so you don't *need* it. If you want minimal storage, just use:
+
+```text
+ocr_meta.jsonl
+```
+
+and filter:
+
+```python
+accepted == false
+```
+
+when you need the rejection audit.
+
+For your project, I'd probably choose:
+
+```text
+layout_meta.jsonl
+ocr_meta.jsonl
+```
+
+and avoid unnecessary duplication.
+
+---
+
+# 4. Use `region_id` as the foreign key
+
+This is particularly important because you already established:
+
+```text
+Stage 2:
+page_id + returned region position
+        ↓
+region_id
+```
+
+For example:
+
+```text
+page025_r000
+page025_r001
+page025_r002
+...
+```
+
+Then you effectively have:
+
+```text
+layout_meta.jsonl
+        │
+        │ region_id
+        ▼
+ocr_meta.jsonl
+        │
+        │ region_id
+        ▼
+Chunk
+```
+
+So you don't need to modify `Chunk`.
+
+Think of `region_id` as the **join key between pipeline artifacts**.
+
+---
+
+# 5. Evidence tier should be metadata, not Chunk state
+
+Your proposed:
+
+```text
+"gold"
+"silver"
+"raw"
+```
+
+fits naturally into the sidecar.
+
+For example:
+
+### Gold
+
+If a line comes from a trusted ground-truth/reference source:
+
+```json
+{
+  "region_id": "page025_r010",
+  "evidence_tier": "gold",
+  "accepted": true
+}
+```
+
+### Silver
+
+Tesseract agrees sufficiently with IA:
+
+```json
+{
+  "region_id": "page025_r011",
+  "ocr_confidence": 93.1,
+  "cer": 0.041,
+  "evidence_tier": "silver",
+  "accepted": true
+}
+```
+
+### Raw
+
+OCR exists but failed your quality gate:
+
+```json
+{
+  "region_id": "page025_r012",
+  "ocr_confidence": 51.3,
+  "cer": 0.42,
+  "evidence_tier": "raw",
+  "accepted": false
+}
+```
+
+The important distinction is:
+
+> **Evidence tier describes the provenance/quality of the transcription; `accepted` describes whether it enters the downstream indexing pipeline.**
+
+Don't conflate those two concepts.
+
+---
+
+# 6. `ocr.py` should produce two outputs conceptually
+
+Your existing function contract may require something like:
+
+```python
+transcribe_region(...) -> str
+```
+
+or perhaps:
+
+```python
+Reader.read(...) -> list[Chunk]
+```
+
+Don't change that contract just to expose metadata.
+
+Instead, internally construct an OCR result:
+
+```python
+ocr_result = {
+    "region_id": region_id,
+    "ocr_text": text,
+    "ocr_confidence": confidence,
+    "cer": cer,
+    "evidence_tier": tier,
+    "accepted": accepted,
+}
+```
+
+Then:
+
+```text
+ocr_result
+     │
+     ├── metadata → ocr_meta.jsonl
+     │
+     └── accepted → Chunk
+```
+
+Conceptually:
+
+```python
+if result["accepted"]:
+    chunks.append(make_chunk(result["ocr_text"]))
+
+write_ocr_metadata(result)
+```
+
+This is essentially a **sidecar metadata / audit-log pattern**.
+
+---
+
+# 7. Rejected lines should NOT reach the index
+
+This is the most important boundary.
+
+You want:
+
+```text
+                 OCR
+                  │
+                  ▼
+             quality gate
+             /           \
+          PASS             FAIL
+           │                 │
+           ▼                 ▼
+        Chunk            audit only
+           │                 │
+           ▼                 ▼
+      search index      ocr_meta.jsonl
+```
+
+So a rejected line can be completely preserved for:
+
+* debugging
+* evaluation
+* threshold tuning
+* future reprocessing
+* auditing
+* explaining why something wasn't indexed
+
+without polluting your vector/text search index.
+
+---
+
+# 8. I would include a rejection reason
+
+Don't store only:
+
+```json
+"accepted": false
+```
+
+Store why:
+
+```json
+"reject_reason": "cer_above_threshold"
+```
+
+Potential values:
+
+```text
+cer_above_threshold
+empty_ocr
+low_ocr_confidence
+reference_alignment_failed
+crop_invalid
+ocr_error
+```
+
+That will be extremely useful later when you analyze your E26 results.
+
+For example, you could discover:
+
+```text
+Rejected:
+  72% CER
+  18% low confidence
+   7% empty OCR
+   3% alignment failure
+```
+
+That gives you actual evidence about where the pipeline fails.
+
+---
+
+# 9. Don't store the full OCR/reference text if storage becomes an issue
+
+Initially, I **would store them** because you're developing and validating the system.
+
+But if the sidecar becomes unnecessarily large, you can eventually store:
+
+```json
+{
+  "region_id": "page025_r018",
+  "ocr_confidence": 48.2,
+  "cer": 0.37,
+  "evidence_tier": "raw",
+  "accepted": false,
+  "reject_reason": "cer_above_threshold"
+}
+```
+
+while obtaining the actual text from the corresponding OCR artifact.
+
+For your current research/development phase, however, keeping `ocr_text` and `reference_text` is useful for auditability.
+
+---
+
+## Recommended architecture for your project
+
+Given your existing Stage 2 design, I would make the pipeline:
+
+```text
+                Stage 2
+                   │
+                   ▼
+             Region objects
+                   │
+                   ├───────────────┐
+                   │               │
+                   ▼               ▼
+          layout_meta.jsonl      Stage 3
+                                   │
+                                   ▼
+                            Tesseract OCR
+                                   │
+                                   ▼
+                            CER quality gate
+                                   │
+                       ┌───────────┴───────────┐
+                       │                       │
+                    ACCEPT                   REJECT
+                       │                       │
+                       ▼                       ▼
+                    Chunk              OCR metadata only
+                       │                       │
+                       ▼                       ▼
+                 Search index          ocr_meta.jsonl
+```
+
+And the key rule is:
+
+> **`Chunk` represents indexable content; `ocr_meta.jsonl` represents OCR provenance, quality, and audit information.**
+
+That is the cleanest solution under your locked `contracts.py` constraint, and it is consistent with the `layout_meta.jsonl` sidecar pattern you already established in Stage 2.
+
+
+User: Requirements for the ocr.py file
+
+Assistant:
+Based on our discussions, `src/doc_agent/vision/ocr.py` should satisfy the following requirements.
+
+## Stage 3 — `ocr.py` Requirements
+
+### 1. Preserve Stage 2 line-level granularity
+
+* Stage 2 already provides **one `Region` per detected text line**.
+* `ocr.py` must process each `Region` independently.
+* **Do not merge regions into page-level text blobs.**
+* Every OCR result must remain traceable to its originating:
+
+  * `page_id`
+  * `region_id`
+  * bounding box
+  * Tesseract `(block_num, par_num, line_num)` provenance through `layout_meta.jsonl`.
+
+This is essential for the **Explainability NFR** and line-level `cite` requirement.
+
+```text
+Page
+ ├── region_000 → line 1 → Chunk
+ ├── region_001 → line 2 → Chunk
+ ├── region_002 → line 3 → Chunk
+ └── ...
+```
+
+---
+
+### 2. `transcribe_region()` must use single-line OCR
+
+Since Stage 2 has already segmented the page into lines, Stage 3 should **not perform layout detection again**.
+
+Use:
+
+```text
+Language:  ben
+OEM:       1
+PSM:       7
+```
+
+i.e.:
+
+```python
+config = "--oem 1 --psm 7"
+pytesseract.image_to_string(crop, lang="ben", config=config)
+```
+
+`--psm 7` tells Tesseract that the crop represents **one text line**.
+
+Do not use `--psm 3` again in Stage 3.
+
+---
+
+### 3. Add boundary-safe crop padding
+
+For every Stage 2 bounding box:
+
+```text
+Region bbox
+    ↓
+~4 px padding
+    ↓
+clamp to image boundaries
+    ↓
+crop
+    ↓
+Tesseract
+```
+
+Recommended default:
+
+```python
+crop_padding_px = 4
+```
+
+Make it configurable if the existing configuration structure allows it.
+
+Padding is important for Bengali because tight crops can clip:
+
+* **matras** at the top
+* upper glyph components/ascenders
+* lower portions of conjuncts
+* **jofala/rafala**
+* other components close to the bounding-box boundary
+
+Do not blindly subtract/add padding without clamping to `[0, width] × [0, height]`.
+
+---
+
+### 4. Preserve OCR output separately from metadata
+
+`Chunk` is a **locked contract** and must not be modified.
+
+Therefore, do **not** add fields such as:
+
+```text
+ocr_confidence
+cer
+evidence_tier
+accepted
+reject_reason
+```
+
+to `Chunk`.
+
+Instead, maintain an OCR sidecar such as:
+
+```text
+data/processed/ocr_meta.jsonl
+```
+
+This should contain **one record per processed line/region**.
+
+---
+
+### 5. Maintain a stable `region_id`
+
+The `region_id` should be the bridge between:
+
+```text
+Stage 2 layout
+        ↓
+Stage 3 OCR
+        ↓
+Chunk
+        ↓
+citation
+```
+
+Use the same ordering established by Stage 2, for example:
+
+```text
+<page_id>_r000
+<page_id>_r001
+<page_id>_r002
+...
+```
+
+Do **not re-sort regions in Stage 3**.
+
+The order returned by Stage 2 is already the canonical reading order.
+
+This is particularly important because `region_id` must remain stable enough to connect OCR metadata and eventual citations.
+
+---
+
+### 6. Track Tesseract provenance
+
+Stage 2's `layout_meta.jsonl` already stores:
+
+```text
+region_id
+page_id
+bbox
+block_num
+par_num
+line_num
+```
+
+Stage 3 should use `region_id` to associate its OCR metadata with that provenance.
+
+Conceptually:
+
+```text
+region_id
+    ↓
+layout_meta.jsonl
+    ├── page_id
+    ├── bbox
+    ├── block_num
+    ├── par_num
+    └── line_num
+             +
+ocr_meta.jsonl
+    ├── OCR text
+    ├── confidence
+    ├── CER
+    ├── evidence tier
+    └── acceptance status
+```
+
+This gives you the complete provenance chain without modifying the locked contract.
+
+---
+
+## 7. Implement the Silver-Label Quality Gate
+
+For every line, compare:
+
+```text
+Tesseract hypothesis
+        ↕
+correctly aligned Internet Archive reference
+```
+
+using **CER (Character Error Rate)**:
+
+[
+CER = \frac{S+D+I}{N}
+]
+
+where:
+
+* `S` = substitutions
+* `D` = deletions
+* `I` = insertions
+* `N` = number of reference characters
+
+Lower CER means better agreement.
+
+---
+
+### 8. Normalize before CER calculation
+
+Do not compare completely raw strings.
+
+At minimum:
+
+```python
+unicodedata.normalize("NFC", text)
+```
+
+and normalize whitespace:
+
+```python
+re.sub(r"\s+", " ", text).strip()
+```
+
+This prevents harmless Unicode/whitespace differences from artificially increasing CER.
+
+Do **not** aggressively normalize away Bengali characters, matras, conjuncts, punctuation, etc., because those are meaningful OCR errors.
+
+---
+
+### 9. Correct reference alignment is required
+
+CER is only meaningful if the Tesseract line is compared against the **corresponding IA reference line**.
+
+Do not blindly assume:
+
+```text
+Tesseract region #17 == IA line #17
+```
+
+unless your reference alignment guarantees that.
+
+The intended flow is:
+
+```text
+Page
+ ↓
+IA reference
+ ↓
+reference-line alignment
+ ↓
+Tesseract Region ↔ IA reference line
+ ↓
+CER
+```
+
+If alignment fails, the line should not receive a misleading CER value.
+
+Use an appropriate audit status such as:
+
+```text
+reference_alignment_failed
+```
+
+---
+
+## 10. Track OCR confidence
+
+For each line, record the Tesseract confidence associated with the OCR result.
+
+Your metadata should contain something like:
+
+```json
+{
+  "region_id": "page025_r017",
+  "ocr_confidence": 91.4,
+  "cer": 0.034,
+  "evidence_tier": "silver",
+  "accepted": true
+}
+```
+
+Keep **OCR confidence and CER as separate measurements**.
+
+They measure different things:
+
+```text
+OCR confidence → Tesseract's internal confidence
+
+CER → agreement with external reference
+```
+
+The Silver gate should primarily use the defined CER criterion, rather than assuming Tesseract confidence proves correctness.
+
+---
+
+## 11. Track evidence tier
+
+Every line should have an evidence classification, e.g.:
+
+```text
+gold
+silver
+raw
+```
+
+The distinction should be explicit:
+
+* **gold** → trusted/reference-grounded transcription
+* **silver** → Tesseract transcription that passes the IA/CER quality gate
+* **raw** → OCR output that does not satisfy the quality gate or lacks sufficient validation
+
+Importantly:
+
+> `evidence_tier` and `accepted` are different concepts.
+
+For example:
+
+```text
+evidence_tier = "raw"
+accepted = false
+```
+
+means the OCR exists but should not enter the clean index.
+
+---
+
+## 12. Rejected lines must be audited, not indexed
+
+The quality gate should behave as:
+
+```text
+                    OCR
+                     │
+                     ▼
+                Quality Gate
+                /           \
+             PASS            FAIL
+              │                │
+              ▼                ▼
+            Chunk          audit metadata
+              │                │
+              ▼                ▼
+         Search index     ocr_meta.jsonl
+```
+
+A rejected line should **not become a searchable Chunk**.
+
+But it should **not disappear** either.
+
+Store it in the OCR sidecar with:
+
+```text
+accepted: false
+reject_reason: ...
+```
+
+Possible reasons:
+
+```text
+cer_above_threshold
+low_ocr_confidence
+empty_ocr
+reference_alignment_failed
+crop_invalid
+ocr_error
+```
+
+---
+
+## 13. Keep the search index clean
+
+The search/indexing layer should receive only accepted content.
+
+Therefore:
+
+```text
+ocr_meta.jsonl
+    = complete audit/provenance layer
+
+Chunk
+    = clean indexable representation
+```
+
+Do not put all the OCR metadata into the searchable text or embedding metadata unless the downstream contract explicitly requires it.
+
+This prevents:
+
+```text
+CER values
+Tesseract IDs
+rejection reasons
+OCR confidence
+```
+
+from polluting semantic retrieval.
+
+---
+
+## 14. Preserve raw OCR for auditing
+
+Do not immediately overwrite raw Tesseract output with normalized text.
+
+Ideally retain:
+
+```text
+ocr_text_raw
+ocr_text_normalized
+reference_text_normalized
+```
+
+at least during development/evaluation.
+
+That allows you to determine whether a failure came from:
+
+```text
+Tesseract OCR
+      ↓
+normalization
+      ↓
+reference alignment
+      ↓
+CER threshold
+```
+
+rather than losing the original evidence.
+
+---
+
+# Recommended `ocr_meta.jsonl` record
+
+A useful line-level record would be approximately:
+
+```json
+{
+  "region_id": "page025_r017",
+  "page_id": "page025",
+  "bbox": [120, 450, 830, 42],
+  "ocr_text_raw": "আমার সোনার বাংলা",
+  "ocr_text_normalized": "আমার সোনার বাংলা",
+  "reference_text_normalized": "আমার সোনার বাংলা",
+  "ocr_confidence": 91.4,
+  "cer": 0.0,
+  "evidence_tier": "silver",
+  "accepted": true,
+  "reject_reason": null
+}
+```
+
+Rejected example:
+
+```json
+{
+  "region_id": "page025_r018",
+  "page_id": "page025",
+  "bbox": [120, 510, 830, 45],
+  "ocr_text_raw": "আমার শনর বাংলা",
+  "ocr_text_normalized": "আমার শনর বাংলা",
+  "reference_text_normalized": "আমার সোনার বাংলা",
+  "ocr_confidence": 48.2,
+  "cer": 0.21,
+  "evidence_tier": "raw",
+  "accepted": false,
+  "reject_reason": "cer_above_threshold"
+}
+```
+
+---
+
+# Final architecture
+
+The complete Stage 2 → Stage 3 design should therefore be:
+
+```text
+                    SCANNED PAGE
+                         │
+                         ▼
+                 Stage 2 Layout
+                         │
+                         ▼
+                 line-level Region
+                         │
+              ┌──────────┴──────────┐
+              │                     │
+       layout_meta.jsonl        Stage 3 OCR
+              │                     │
+       block/par/line IDs           ▼
+                              4px padded crop
+                                    │
+                                    ▼
+                              Tesseract ben
+                           --oem 1 --psm 7
+                                    │
+                                    ▼
+                              OCR hypothesis
+                                    │
+                           ┌────────┴────────┐
+                           │                 │
+                      OCR metadata      IA reference
+                           │                 │
+                           └────────┬────────┘
+                                    ▼
+                                   CER
+                                    │
+                              Silver Gate
+                             /            \
+                          PASS             FAIL
+                           │                 │
+                           ▼                 ▼
+                         Chunk         audit metadata
+                           │                 │
+                           ▼                 ▼
+                    Clean search       ocr_meta.jsonl
+                       index
+                           │
+                           ▼
+                 Line-level citation
+                 page + region/line
+```
+
+### The central rule
+
+> **Never sacrifice line-level provenance for convenience.** Each Stage 2 `Region` remains an independently traceable line, each accepted line produces its own indexable `Chunk`, and all OCR-quality information stays in a sidecar rather than modifying `Chunk`.
+
+That directly supports your **Explainability NFR and `cite` requirement** while keeping the search index clean.
+
+
+User: Uploaded initial ocr implementation file for verification
+
+Assistant:
+I verified the uploaded `ocr.py` implementation against the requirements we established. The file is **syntactically valid**, and the overall architecture is strong. 
+
+However, I would **not call it completely ready yet**. There are **two important architectural issues** to fix, plus a few smaller points.
+
+## Overall verdict
+
+| Requirement                               | Status                                            |
+| ----------------------------------------- | ------------------------------------------------- |
+| Preserve line-level regions               | ✅                                                 |
+| No page-level OCR blobs                   | ✅                                                 |
+| `--oem 1 --psm 7 -l ben`                  | ✅                                                 |
+| 4 px boundary-clamped padding             | ✅                                                 |
+| Bengali-safe NFC/whitespace normalization | ✅                                                 |
+| CER implementation                        | ✅                                                 |
+| Configurable CER threshold                | ✅                                                 |
+| OCR confidence metadata                   | ✅                                                 |
+| `gold` / `silver` / `raw` tiers           | ✅                                                 |
+| Accepted/rejected audit trail             | ✅                                                 |
+| Rejected lines excluded from `Chunk`      | ✅                                                 |
+| `Chunk` remains unmodified                | ✅                                                 |
+| `region_id` ↔ `chunk_id` provenance       | ✅                                                 |
+| Stage 2 reading order preserved           | ✅                                                 |
+| Layout provenance cross-check             | ✅                                                 |
+| **Correct IA ↔ OCR line alignment**       | ⚠️ **Not sufficiently guaranteed**                |
+| **Gold-line correctness**                 | ⚠️ **Potential issue depending on labels format** |
+
+---
+
+# 1. Your core architecture is correct
+
+The strongest part of the implementation is that you have kept the distinction between the **index representation** and the **OCR audit representation**.
+
+You correctly document that `Chunk` cannot carry confidence/CER/tier and that these live in `ocr_meta.jsonl`, keyed by `region_id` and `chunk_id`. 
+
+And the actual behavior follows that design:
+
+```text
+Region
+   │
+   ├── accepted → Chunk
+   │
+   └── rejected → ocr_meta.jsonl only
+```
+
+This is exactly what we wanted.
+
+Your `transcribe()` explicitly says every region gets an audit row, while rejected regions do not produce Chunks. 
+
+That satisfies the **line-level provenance requirement** much better than merging lines into page text.
+
+---
+
+# 2. Stage 3 OCR configuration is correct
+
+You have:
+
+```python
+config = f"--oem {oem} --psm 7 -l {lang}"
+```
+
+with defaults:
+
+```python
+lang = self.cfg.get("lang", "ben")
+oem = self.cfg.get("oem", 1)
+```
+
+So the effective default is:
+
+```text
+--oem 1 --psm 7 -l ben
+```
+
+which is exactly what we established. 
+
+And importantly, you're using `image_to_data()` rather than `image_to_string()` because you need a confidence value. That's a good implementation choice.
+
+---
+
+# 3. The 4 px crop padding is correctly implemented
+
+This is good:
+
+```python
+pad = 4
+x0, y0 = max(0, x - pad), max(0, y - pad)
+x1, y1 = min(img.shape[1], x + w + pad), min(img.shape[0], y + h + pad)
+```
+
+It gives you exactly the boundary-safe behavior we discussed. 
+
+You are protecting the upper/lower glyph components without allowing the crop coordinates to go outside the image.
+
+---
+
+# 4. CER implementation is correct
+
+Your implementation:
+
+```python
+return _levenshtein(hyp, ref) / len(ref)
+```
+
+correctly implements:
+
+[
+CER = \frac{S+D+I}{N}
+]
+
+because Levenshtein distance represents the minimum number of substitutions, deletions and insertions. 
+
+And you're doing:
+
+```python
+unicodedata.normalize("NFC", text)
+re.sub(r"\s+", " ", text).strip()
+```
+
+which is the conservative normalization we discussed. 
+
+That's appropriate for Bengali. You're **not stripping punctuation or Bengali characters**, which is important for a literary corpus.
+
+---
+
+# 5. The biggest problem: reference alignment
+
+This is the part I would change before relying on the Silver gate.
+
+Your current method assumes:
+
+```text
+Tesseract region 0 ↔ IA line 0
+Tesseract region 1 ↔ IA line 1
+Tesseract region 2 ↔ IA line 2
+...
+```
+
+You explicitly acknowledge this:
+
+> "Line-to-line correspondence is positional..." 
+
+The problem is that your sanity check:
+
+```python
+0.5 <= ratio <= 2.0
+```
+
+does **not actually establish alignment**.
+
+For example:
+
+```text
+Tesseract: 100 lines
+IA:       80 lines
+```
+
+passes the test.
+
+But then:
+
+```text
+Tesseract line 40
+       ↕
+IA line 40
+```
+
+may refer to completely different literary lines because IA may have merged/split lines earlier on the page.
+
+That can produce a **false low CER and incorrectly label corrupted OCR as silver**.
+
+### For your current implementation, I recommend one of two approaches.
+
+#### Option A — safest for now
+
+Require exact line-count equality:
+
+```python
+if len(lines) != expected_n_lines:
+    return None
+```
+
+Then:
+
+```text
+IA lines == detected regions
+        ↓
+positional comparison
+```
+
+This is much safer than the current `0.5–2.0×` rule.
+
+#### Option B — proper long-term solution
+
+Implement actual sequence alignment between the IA reference and detected OCR lines.
+
+That's more sophisticated and probably belongs in an offline dataset-preparation step rather than the OCR hot path.
+
+Your own comments recognize this distinction. 
+
+**For the current Stage 3 implementation, I recommend Option A.**
+
+It is simple, deterministic, and conservative.
+
+---
+
+# 6. Your "no reference = reject" behavior is excellent
+
+This part is exactly what I want:
+
+```python
+elif not ref_norm:
+    row["accepted"] = False
+    row["reject_reason"] = "reference_alignment_failed"
+    row["evidence_tier"] = "raw"
+```
+
+So you're not doing:
+
+```text
+No IA reference
+     ↓
+"probably okay"
+     ↓
+index it
+```
+
+Instead:
+
+```text
+No trustworthy reference
+       ↓
+raw
+       ↓
+reject
+       ↓
+audit only
+```
+
+That is the correct conservative behavior for a quality gate.
+
+Your file even notes that the current data-fetch script doesn't populate the reference files yet, so non-gold lines will safely reject until that infrastructure exists. 
+
+---
+
+# 7. One potentially important issue: `gold`
+
+You currently do:
+
+```python
+if is_gold_page:
+    row["accepted"] = True
+    row["evidence_tier"] = "gold"
+```
+
+regardless of CER. 
+
+This is only correct **if `labels.jsonl` truly provides independently reviewed line-level ground truth for every Region on that page**.
+
+Your `_load_gold_page_ids()` currently treats a page as gold if it has:
+
+```python
+pid = row.get("page_id")
+text = row.get("text", "")
+```
+
+and the text isn't `"REPLACE ME"`. 
+
+So you're effectively saying:
+
+> "This page has a human-reviewed label, therefore every Tesseract OCR line on this page is gold."
+
+That's a potentially dangerous inference.
+
+### If `labels.jsonl` is page-level ground truth
+
+Then **don't call the Tesseract output itself `gold`**.
+
+Instead, you need something like:
+
+```text
+human-reviewed reference → gold
+Tesseract matching gold → evaluated OCR
+```
+
+A Tesseract hypothesis shouldn't automatically become gold merely because the page is in the gold evaluation set.
+
+If your `labels.jsonl` really does contain independently reviewed **line-level labels that correspond to every region**, then your current logic can be justified—but that isn't demonstrated by this `ocr.py` alone.
+
+So this is something I would verify against the grading-kit specification before merging.
+
+---
+
+# 8. Your line-level Chunk design is good
+
+This is particularly important given your NFR.
+
+You generate:
+
+```python
+region_id = f"{page_id}_r{idx:03d}"
+chunk_id = f"{page_id}_l{idx:03d}"
+```
+
+and:
+
+```python
+Chunk(
+    id=chunk_id,
+    doc_id=doc_id,
+    text=norm_text,
+    page_ids=[page_id]
+)
+```
+
+ 
+
+That means you have:
+
+```text
+page025_r017
+       │
+       └── page025_l017
+                 │
+                 └── Chunk
+```
+
+and `ocr_meta.jsonl` can join the two.
+
+This preserves **line-level Chunk identity**, which is exactly what your explainability requirement needs.
+
+You are **not** doing the bad design:
+
+```text
+page025 → one giant Chunk
+```
+
+So this part is solid.
+
+---
+
+# 9. Don't re-sort in Stage 3 — correct
+
+You explicitly preserve Stage 2's ordering:
+
+```python
+for r in regions:
+    by_page.setdefault(r.page_id, []).append(r)
+```
+
+and you don't call `sorted()` afterward. 
+
+That's correct.
+
+Stage 2 established:
+
+```text
+Y primary
+X secondary
+```
+
+and Stage 3 should consume that canonical ordering unchanged.
+
+---
+
+# 10. The layout provenance check is good, but incomplete
+
+You check:
+
+```python
+layout_row["bbox"] == region.bbox
+```
+
+and warn if there is a mismatch. 
+
+That's useful.
+
+But because your Explainability NFR specifically cares about line provenance, I'd consider also verifying the **number/order of regions per page**.
+
+The `region_id` itself is regenerated from the position:
+
+```python
+page_id_r000
+page_id_r001
+...
+```
+
+So if Stage 2 and Stage 3 silently disagree about the region count/order, the IDs can become misleading.
+
+Your current bbox check catches many such cases, which is good, but I would eventually make a mismatch a **hard error**, not merely a warning, if `layout_meta.jsonl` is present.
+
+Otherwise you can theoretically produce:
+
+```text
+Stage 2:
+page25_r017 → bbox A
+
+Stage 3:
+page25_r017 → bbox B
+```
+
+and still continue.
+
+For an explainability-focused system, provenance corruption should be treated seriously.
+
+---
+
+# 11. One minor naming issue
+
+You have:
+
+```python
+chunk_id = f"{page_id}_l{idx:03d}"
+```
+
+That's fine, but your `Chunk` itself only contains:
+
+```text
+id
+doc_id
+text
+page_ids
+```
+
+The **line identity is therefore encoded in the ID**, not explicitly represented as a structured field.
+
+That's acceptable because `Chunk` is locked.
+
+Your sidecar compensates for this:
+
+```json
+{
+    "region_id": "...",
+    "chunk_id": "..."
+}
+```
+
+So I would keep it.
+
+---
+
+# 12. One thing I would add to the metadata
+
+For your auditability, I'd add the CER threshold used for the decision:
+
+```json
+"cer_threshold": 0.15
+```
+
+Then your audit record tells you:
+
+```text
+CER = 0.13
+threshold = 0.15
+accepted = true
+```
+
+rather than requiring you to know which configuration was active months later.
+
+Similarly, recording:
+
+```json
+"ocr_config": "--oem 1 --psm 7 -l ben"
+```
+
+would make reproducibility stronger.
+
+These aren't required for the basic architecture, but they're valuable for research evaluation.
+
+---
+
+# Final assessment
+
+### **I would approve most of this implementation, but make these changes before calling Stage 3 complete:**
+
+### Must fix
+
+**1. Make reference alignment conservative.**
+
+Change:
+
+```python
+0.5 <= ratio <= 2.0
+```
+
+to exact line-count matching for the current positional strategy:
+
+```python
+len(lines) != expected_n_lines → alignment failure
+```
+
+Otherwise the Silver gate can produce false accepts.
+
+**2. Verify the meaning of `labels.jsonl` before allowing `is_gold_page` to override the CER gate.**
+
+If it is **page-level** ground truth, don't automatically turn every Tesseract line on that page into `"gold"`.
+
+---
+
+### Already correct
+
+* ✅ line-level `Region` → line-level `Chunk`
+* ✅ `region_id` provenance
+* ✅ `chunk_id` join key
+* ✅ Stage 2 ordering preserved
+* ✅ no page-level merging
+* ✅ `--oem 1 --psm 7 -l ben`
+* ✅ 4 px boundary-clamped padding
+* ✅ conservative Bengali normalization
+* ✅ proper CER
+* ✅ configurable `max_cer_target = 0.15`
+* ✅ OCR confidence
+* ✅ `gold`/`silver`/`raw`
+* ✅ accepted/rejected state
+* ✅ rejection reasons
+* ✅ rejected lines excluded from index
+* ✅ complete `ocr_meta.jsonl` audit trail
+* ✅ `Chunk` contract untouched
+
+So **you're very close**. The implementation isn't fundamentally wrong; the main thing I would not let pass without modification is the **IA line-alignment guarantee**, because that directly affects whether your Silver-Label gate can be trusted.
+
+
+User: Reuploaded the ocr.py file after modification
+
+Assistant:
+Yes. I checked the full `test_ocr.py` you uploaded against the current `ocr.py` implementation and the Stage 2 layout implementation we've been discussing.
+
+**You do not need to change `test_ocr.py` itself.** It is already testing the current design, including the newer exact-line-count alignment and provenance requirements. 
+
+However, there are a few **project-level things you need to make sure are present before running the tests.**
+
+### 1. `tests/conftest.py` is the most important dependency
+
+Your tests all depend on:
+
+```python
+synthetic_corpus
+```
+
+and the fixture must provide at least:
+
+```text
+paths.processed_dir
+paths.raw_dir
+ocr.lang
+ocr.max_cer_target
+ocr.min_line_chars
+grading_kit.labels_path
+```
+
+The tests explicitly modify/use those values.  
+
+So before running, verify that your `synthetic_corpus` fixture creates:
+
+```text
+data/raw/testwork/
+data/processed/
+```
+
+and the synthetic page IDs are:
+
+```text
+testwork_p0001
+testwork_p0002
+```
+
+because the tests hard-code those IDs. 
+
+---
+
+### 2. Your synthetic corpus must actually produce 3 lines on `p0001`
+
+Several tests assume:
+
+```text
+testwork_p0001
+    ├── line 0
+    ├── line 1
+    └── line 2
+```
+
+For example, the reference-alignment test explicitly writes **4 reference lines** and expects them to mismatch the **3 detected regions**. 
+
+The CER test also assumes exactly three lines. 
+
+So this isn't just incidental—the fixture's OCR/layout output must remain stable.
+
+---
+
+### 3. You need Tesseract + Bengali trained data installed
+
+Your actual `ocr.py` invokes:
+
+```text
+--oem 1 --psm 7 -l ben
+```
+
+so the environment running pytest needs the Bengali Tesseract language data.
+
+You should be able to run:
+
+```bash
+tesseract --list-langs
+```
+
+and see:
+
+```text
+ben
+```
+
+Otherwise the tests that reach real OCR will fail before your assertions are meaningful.
+
+---
+
+### 4. `pytesseract`, OpenCV and Tesseract must all be available
+
+The test is **not mocking OCR**. It runs:
+
+```python
+preprocess.run(...)
+layout.detect(...)
+ocr.transcribe(...)
+```
+
+so this is effectively an integration test for the Stage 2 → Stage 3 path. 
+
+You therefore need:
+
+```text
+Python
+ ├── pytesseract
+ ├── opencv-python
+ └── your doc_agent package
+       ↓
+system
+ └── tesseract
+       └── ben.traineddata
+```
+
+---
+
+### 5. `layout_meta.jsonl` must be produced
+
+Your tests explicitly depend on the Stage 2 sidecar:
+
+```text
+layout_meta.jsonl
+```
+
+and verify that every OCR `region_id` can be joined to it. 
+
+They also deliberately tamper with a region's bounding box and expect:
+
+```text
+layout_provenance_mismatch
+```
+
+rather than a crash. 
+
+So **Stage 2 must run successfully before Stage 3**.
+
+---
+
+### 6. No need to manually create `ocr_meta.jsonl`
+
+Your `ocr.py` creates it:
+
+```text
+data/processed/ocr_meta.jsonl
+```
+
+and the tests verify that every region produces an audit row. 
+
+So don't create a fixture version of that file beforehand.
+
+The tests intentionally exercise its generation.
+
+---
+
+### 7. No need to create the IA `.ref.txt` globally
+
+Some tests create their own reference file:
+
+```text
+data/raw/testwork/testwork_p0001.ref.txt
+```
+
+For example:
+
+```python
+(raw_dir / "testwork_p0001.ref.txt").write_text(...)
+```
+
+
+
+So you **shouldn't need to manually add this file** just to run the tests.
+
+In fact, the first rejection test intentionally tests the absence of a reference and expects:
+
+```text
+reference_alignment_failed
+```
+
+
+
+---
+
+## One thing I would check carefully: test isolation
+
+This is the only thing in `test_ocr.py` that makes me slightly cautious.
+
+Several tests write:
+
+```text
+testwork_p0001.ref.txt
+```
+
+into the same `synthetic_corpus["paths"]["raw_dir"]`.
+
+For example:
+
+* alignment mismatch test writes 4 lines 
+* CER test later writes a different 3-line reference 
+
+If `synthetic_corpus` creates a **fresh temporary corpus for every test**, you're fine.
+
+If the fixture reuses the same directory between tests, then test order/state can leak.
+
+I would make sure the fixture has function scope (the pytest default):
+
+```python
+@pytest.fixture
+def synthetic_corpus(tmp_path):
+    ...
+```
+
+rather than:
+
+```python
+@pytest.fixture(scope="session")
+```
+
+That ensures each test gets its own raw/processed directories.
+
+---
+
+# What you need to change
+
+### In `test_ocr.py`
+
+**Nothing.** ✅
+
+### In `ocr.py`
+
+Based on the version we just reviewed, **nothing specifically for these tests**. Your current implementation exposes the expected behavior.
+
+### In the project/environment
+
+Verify:
+
+```text
+✅ tests/conftest.py provides synthetic_corpus
+✅ fixture creates testwork_p0001/p0002
+✅ p0001 produces 3 regions
+✅ Tesseract installed
+✅ Tesseract `ben` language installed
+✅ pytesseract installed
+✅ OpenCV installed
+✅ layout.py produces layout_meta.jsonl
+✅ pytest can import doc_agent
+✅ fixture is isolated per test
+```
+
+Then run:
+
+```bash
+pytest tests/test_ocr.py -v
+```
+
+If you want to run only the Stage 3 tests first:
+
+```bash
+pytest tests/test_ocr.py -v
+```
+
+There are **12 tests** in the file, and importantly, the last two are actually Stage 2 tests (`test_layout_orders_lines...` and `test_layout_writes_traceability_sidecar`). 
+
+So don't be surprised that running `test_ocr.py` also validates your Stage 2 implementation.
+
+### One final important point
+
+The tests themselves are now aligned with our architecture:
+
+```text
+Stage 2 Region
+      ↓
+region_id
+      ↓
+Stage 3 OCR
+      ↓
+ocr_meta.jsonl
+      ↓
+accepted?
+   ↙       ↘
+yes         no
+ ↓           ↓
+Chunk      audit only
+ ↓
+index/cite
+```
+
+That is exactly the architecture we want for your **line-level Explainability NFR**.
+
+
+User: Uploaded kb_demo.ipynb
+Please check if the current implementation looks good. You can verify it against the cell outputs.
+
+Assistant:
+I checked the current kb_demo(1).ipynb including its saved outputs, and the implementation is running successfully, but the OCR result is not good yet. There is also an important distinction between a notebook/evaluation issue and an actual OCR/layout issue.
+
+What is working correctly
+
+The pipeline itself is executing end-to-end:
+
+loader
+  ↓
+preprocess
+  ↓
+layout.detect
+  ↓
+ocr.transcribe
+  ↓
+ocr_meta.jsonl
+  ↓
+CER/WER evaluation
+
+The saved output shows:
+
+833 pages discovered across 6 documents.
+5 gold-labelled pages selected.
+All 5 pages successfully preprocessed.
+0 blank/separator pages dropped.
+Stage 2 detected 81 line regions.
+Stage 3 OCR processed all 81 regions.
+ocr_meta.jsonl was successfully generated.
+
+
+The important problem: 0/81 OCR lines accepted
+
+Your Stage 3 output says:
+
+OCR'd 81 regions across 5 pages: 0 accepted -> 0 chunks, 81 rejected
+
+That means the quality gate is rejecting every single OCR line.
+
+This is not normal if your gold labels actually correspond to the OCR output/reference lines.
+
+However, it does not necessarily mean the OCR itself is completely broken.
+
+Your current ocr.py has a strict decision chain:
+
+layout provenance
+minimum line length
+exact gold CER = 0 → gold
+otherwise IA reference CER ≤ threshold → silver
+otherwise → raw / rejected.
+
+So we need to inspect why those 81 lines failed.
+
+The bigger issue: your line segmentation doesn't match the gold labels
+
+This is the most important finding from the notebook.
+
+You have:
+
+Page	OCR lines	Gold lines
+arogya_p0053	26	31
+bishwaparichay_p0343	31	6
+chandalika_p0161	7	27
+chitrangada_p0130	11	31
+tin_sangi_p0219	6	11
+
+The notebook explicitly reports that all five pages have mismatched line counts.
+
+This is extremely significant.
+
+Your Stage 3 quality gate assumes positional correspondence:
+
+OCR line 0 ↔ reference line 0
+OCR line 1 ↔ reference line 1
+...
+
+and your implementation deliberately requires exact line-count alignment. That's architecturally sensible for your line-level citation requirement, because silently aligning mismatched lines would make provenance unreliable. Your tests explicitly enforce this exact-count rule.
+
+So do not weaken that gate just to get a CER number.
+
+Your current page-level CER/WER is useful, but it reveals poor OCR
+
+Because line counts don't match, you added page-level scoring.
+
+The result is:
+
+Page-level mean CER: 0.6515
+Page-level mean WER: 0.7817
+
+That's very high error.
+
+So at this point, I would not call the current OCR implementation acceptable for your final Stage 3 result.
+
+But there is an important caveat:
+
+Your gold-standard evaluation is comparing different granularities
+
+For example:
+
+Gold:
+31 lines
+
+Tesseract layout:
+26 lines
+
+That can happen because your Stage 2 detector is producing a different segmentation from the human transcription.
+
+And you deliberately made Stage 2 produce Tesseract line-level regions, not human-defined literary lines.
+
+That means there are actually two separate things being measured:
+
+A. OCR recognition quality
+B. Layout/line segmentation agreement
+
+Your current notebook mixes them at page level.
+
+I would NOT change the Stage 3 gate yet
+
+Your current Stage 3 implementation itself is conceptually correct:
+
+Region
+ ↓
+4px padded crop
+ ↓
+Tesseract --oem 1 --psm 7 -l ben
+ ↓
+normalize
+ ↓
+CER
+ ↓
+gold / silver / raw
+ ↓
+accepted Chunk OR audit-only row
+
+The code confirms that you're using exactly the intended single-line configuration and 4px clamped padding.
+
+And the sidecar architecture is also correct: rejected OCR remains in ocr_meta.jsonl, while only accepted lines become Chunks.
+
+That is exactly what we want for your Explainability NFR.
+
+My verdict right now
+
+Pipeline implementation: ✅ Good
+Stage 2 → Stage 3 provenance architecture: ✅ Good
+4px padding + PSM 7: ✅ Good
+Sidecar/audit architecture: ✅ Good
+Line-level citation granularity: ✅ Good
+Notebook execution: ✅ Good
+Gold/reference alignment: ⚠️ Major mismatch
+Current OCR accuracy: ❌ Poor based on page-level CER/WER
+0/81 accepted: ⚠️ Needs investigation, not immediate code changes
+
+Most importantly, don't change the exact line-count requirement just to make the evaluation pass. That requirement protects the line-level provenance you need for your Explainability NFR. The next step should be to inspect the actual ocr_meta.jsonl rows and determine whether the 0 accepted lines are caused by OCR recognition or line/reference segmentation mismatch.
+
+User:No pages had exact line-count matches, so line-level scoring was skipped. Page-level mean CER: 0.0990 Page-level mean WER: 0.3491
+Is this result worse than our previous run?
+
+Assistant:
+No — this is much better than before.
+
+Your earlier results were:
+
+Mean CER: 0.6515
+Mean WER: 0.7817
+
+Now you have:
+
+Mean CER: 0.0990
+Mean WER: 0.3491
+Comparison
+Metric	Before	Now	Improvement
+CER	0.6515	0.0990	~85% lower
+WER	0.7817	0.3491	~55% lower
+
+For CER, this is a major improvement. A CER of 0.099 means roughly 9.9% character-level edit distance relative to the reference, versus 65.15% previously.
+
+WER also improved substantially, although 34.9% is still fairly high.
+
+But there's an important caveat
+
+The message:
+
+"No pages had exact line-count matches, so line-level scoring was skipped."
+
+means these numbers are page-level CER/WER, not your desired line-level evaluation.
+
+So right now you can say:
+
+The OCR recognition quality has improved substantially based on page-level evaluation, but line-level CER/WER cannot yet be reported because Stage 2's segmentation does not match the gold transcription's line segmentation.
+
+That's actually a useful finding for your project.
+
+What I would not do
+
+Don't artificially force the line counts to match just so you can produce line-level CER.
+
+Your Explainability NFR requires:
+
+Chunk
+ ↓
+specific OCR region
+ ↓
+specific page
+ ↓
+specific line
+
+If you incorrectly align:
+
+OCR line 17 ↔ gold line 17
+
+when the two aren't actually the same literary line, your CER becomes misleading.
+
+The next question is therefore
+
+Why are the line counts different even though the OCR quality improved to CER ≈ 0.099?
+
+If the OCR text itself now looks reasonably accurate, the remaining problem may primarily be Stage 2 segmentation, not Stage 3 OCR.
+
+For example, Tesseract may produce:
+
+Gold:
+line 1
+line 2
+line 3
+line 4
+
+Tesseract:
+line 1 + line 2
+line 3
+line 4
+
+The OCR can still be mostly correct while the line segmentation is different.
+
+So 0.0990 / 0.3491 is definitely an improvement, but I would not yet use it as your final Stage 3 quality claim until we resolve the line-level alignment issue.
+
+User: Line-level mean CER: 0.0595 Line-level mean WER: 0.2988 Page-level mean CER: 0.0899 Page-level mean WER: 0.3460 check these results
+
+Assistant:
+Yes — these results are substantially better and now you have successful line-level evaluation, which is much more useful for your project.
+
+Current results
+Metric	Line-level	Page-level
+CER	0.0595 (5.95%)	0.0899 (8.99%)
+WER	0.2988 (29.88%)	0.3460 (34.60%)
+Compared with your previous results
+
+Previously:
+
+Page CER: 0.0990
+Page WER: 0.3491
+No line-level scoring
+
+Now:
+
+Line CER: 0.0595
+Line WER: 0.2988
+Page CER: 0.0899
+Page WER: 0.3460
+
+So this is an improvement:
+
+Page CER: 0.0990 → 0.0899
+Page WER: 0.3491 → 0.3460
+And, importantly, you now have valid line-level measurements.
+What the numbers tell us
+
+1. CER = 5.95% at line level
+
+This is a fairly good result for scanned historical Bengali material. It means the OCR hypothesis differs from the normalized reference by about 6 character edits per 100 reference characters, on average.
+
+2. WER = 29.88%
+
+This is considerably higher than CER, which is expected for Bengali OCR. A single character error can make an entire whitespace-delimited word count as incorrect.
+
+For example, conceptually:
+
+Reference:  রবীন্দ্রনাথ
+OCR:        রবীন্দ্রনাথ
+
+→ correct.
+
+But even a small conjunct/diacritic error can turn one otherwise recognizable word into a WER error.
+
+So CER is probably the more informative primary metric for your Bengali OCR evaluation, while WER provides a useful secondary metric.
+
+Most importantly: your architecture is now giving the right kind of evidence
+
+You wanted:
+
+Page
+ ├── Line 0 → OCR → CER → accepted/rejected
+ ├── Line 1 → OCR → CER → accepted/rejected
+ ├── Line 2 → OCR → CER → accepted/rejected
+ ...
+
+and now you're actually measuring:
+
+Line-level CER = 0.0595
+Line-level WER = 0.2988
+
+That is much more aligned with your Explainability NFR, because your retrieval unit remains the individual line/region rather than a page-level blob.
+
+One thing I would verify before calling this final
+
+Check how many lines/pages were actually scored.
+
+You want the notebook to report something like:
+
+Scored: XXX lines across Y gold pages
+Skipped: Z pages due to line-count mismatch
+
+If most of your gold pages/lines were scored, then 5.95% CER is a strong and meaningful result.
+
+If only a small subset was scored, we should be more cautious about reporting it as the overall OCR accuracy.
+
+So: yes, these results are better, and the fact that line-level CER/WER are now available is the bigger improvement.
+
+
+User: Line-level mean CER: 0.0846 Line-level mean WER: 0.3682 Page-level mean CER: 0.0936 Page-level mean WER: 0.3522
+Is this result bad? I used 5 different pages this time. Should I add more?
+
+Assistant:
+No, it's not bad, but it is worse than your previous result, and the increase is worth understanding.
+
+Your results
+Metric	Previous	Now	Change
+Line CER	0.0595	0.0846	↑ 42%
+Line WER	0.2988	0.3682	↑ 23%
+Page CER	0.0899	0.0936	↑ 4%
+Page WER	0.3460	0.3522	↑ 2%
+
+Lower is better, so the new five pages pulled the line-level average upward.
+
+But this is actually a good sign for your evaluation
+
+Don't remove the new pages just because they make the score worse.
+
+If you are building a credible ground-truth/evaluation set, you want representative difficult pages, not only pages where Tesseract performs beautifully.
+
+A move from:
+
+5.95% → 8.46% CER
+
+doesn't mean the OCR implementation suddenly became bad. It may simply mean the additional pages contain more difficult Bengali typography, poetry, damaged scans, unusual formatting, etc.
+
+Your page-level CER of 9.36% is still quite reasonable as an empirical OCR result for this kind of historical scanned literary corpus.
+
+Should you add more pages?
+
+Yes. Definitely.
+
+Five additional pages is still a very small evaluation sample for a corpus of hundreds of pages.
+
+I'd aim for at least 30–50 manually reviewed pages for your project evaluation if you can afford the Gemini/human-review effort.
+
+Even better, don't randomly choose all of them. Make the sample stratified.
+
+For example:
+
+Page type	Suggested sample
+Normal prose	10
+Poetry	10
+Dialogue/drama	5
+Centered/indented text	5
+Headings/stage directions	5
+Visually difficult/low-quality scans	5
+Total	40
+
+This would be much more defensible in your report than saying:
+
+"We evaluated OCR on 10 randomly selected pages."
+
+More importantly: track confidence intervals / distribution
+
+Don't report only:
+
+Mean CER = 0.0846
+
+Once you have more pages, also report:
+
+Mean CER
+Median CER
+Std deviation
+Min CER
+Max CER
+Number of pages
+Number of lines
+
+For example:
+
+Gold pages:       40
+Gold lines:       1,200
+
+CER:
+  Mean:           0.0846
+  Median:         0.061
+  Std:            0.071
+  Min:            0.000
+  Max:            0.421
+
+WER:
+  Mean:           0.3682
+
+That tells your evaluator much more about the system.
+
+One thing I'd investigate now
+
+The line-level vs page-level difference is interesting:
+
+Line CER:   8.46%
+Page CER:   9.36%
+
+That's not concerning by itself.
+
+But the WER:
+
+Line WER:   36.82%
+Page WER:   35.22%
+
+shows that individual lines are relatively difficult at the word level.
+
+For Bengali literary OCR, I'd make CER your primary metric and WER your secondary metric.
+
+Your project's actual goal isn't perfect word tokenization; it's preserving the correct literary text and line-level provenance for retrieval/citation.
+
+My recommendation
+
+Keep these 5 pages. Don't discard them.
+
+Then add more until you have roughly 30–50 gold pages, ideally covering different literary/layout types.
+
+And don't chase the old 5.95% CER. If the final representative sample settles around 8–10% CER, that's a much more credible result than an artificially favorable 6% obtained from an easy subset.
+
+For your report, something like:
+
+"Stage 3 achieved a mean character error rate of approximately 8–10% across a stratified gold-standard sample of X pages."
+
+would be much stronger once you have enough pages behind that number.
+
+
+User: Line-level mean CER: 0.0967 Line-level mean WER: 0.3999 Page-level mean CER: 0.0999 Page-level mean WER: 0.3658
+Please check this out. I have now tested it against 11 pages.
+
+Assistant:
+Yes — 11 pages is a much more useful sample, and these results are still quite reasonable for your corpus. The important thing is that the scores are now starting to stabilize as you add more difficult pages.
+
+Current result
+Metric	Current (11 pages)
+Line CER	0.0967 (9.67%)
+Line WER	0.3999 (39.99%)
+Page CER	0.0999 (9.99%)
+Page WER	0.3658 (36.58%)
+Compared with your earlier results
+
+You went:
+
+5 pages added:
+Line CER  = 0.0846
+Line WER  = 0.3682
+
+11 pages:
+Line CER  = 0.0967
+Line WER  = 0.3999
+
+So the score got worse as you added pages, but that's exactly what you should expect if the additional pages include harder material.
+
+The key observation is that your line CER and page CER are now very close:
+
+9.67% vs 9.99%
+
+That's actually reassuring. It suggests your line-level evaluation isn't wildly diverging from the page-level evaluation.
+
+Should you keep adding pages?
+
+Yes, but don't add pages just to improve the number.
+
+At 11 pages, I would continue to ~30 pages minimum for a project evaluation.
+
+If Gemini/API cost and manual verification aren't an issue, I'd aim for 30–50 pages.
+
+More importantly, make the selection representative:
+
+Prose                  ██████████
+Poetry                 ███████
+Drama/dialogue         █████
+Headings               ███
+Indented/centered      ███
+Difficult scans        ████
+
+You want the evaluation set to reflect the actual characteristics you identified in Volume 25.
+
+Your CER is more important than WER here
+
+For your Bengali literary corpus:
+
+CER ≈ 9.7%
+
+is the number I'd emphasize.
+
+WER ≈ 40% looks much scarier, but WER is extremely sensitive to individual character errors.
+
+For example, if OCR produces a single incorrect conjunct inside a word, the entire word becomes a WER error:
+
+Reference:  রবীন্দ্রনাথ
+OCR:        রবীন্দ্রনাথ  ← one character/conjunct error
+
+That can contribute:
+
+CER → relatively small penalty
+WER → entire word counted as incorrect
+
+So for your use case, I'd report:
+
+Primary: CER
+Secondary: WER
+
+One thing I would NOT do
+
+Don't change your OCR configuration now simply because the score moved from ~6% to ~10%.
+
+Your evaluation set is changing.
+
+The correct experiment is:
+
+Fixed OCR pipeline
+        ↓
+Increasing representative gold set
+        ↓
+CER/WER converges
+
+rather than:
+
+Add difficult page
+        ↓
+Score gets worse
+        ↓
+Change OCR
+        ↓
+Score improves
+        ↓
+Add another page
+        ↓
+Change OCR again
+
+The latter gives you an overfit evaluation.
+
+Where I'd stop
+
+I'd recommend:
+
+11 pages → continue to ~30 pages → freeze the OCR implementation → report final metrics.
+
+If the final result settles around:
+
+Line CER ≈ 0.08–0.12
+Page CER ≈ 0.09–0.12
+
+that's a perfectly defensible empirical result for your project, especially given that you're working with historical Bengali literary scans with complex typography.
+
+And importantly, 9.67% line CER means roughly 90.3% character-level similarity after your normalization, which is far more informative than the earlier 65% CER result you had.
+
+
+User: but the wer score is very high which is not good
+
+Assistant:
+Yeah 😭 40% WER is high. But I wouldn't panic yet, because for your project there are two separate questions:
+
+Is the OCR actually producing too many wrong words?
+Is your WER implementation making Bengali OCR look worse than it really is?
+
+Given your CER ≈ 9.7% but WER ≈ 40%, I would investigate #2 before changing the OCR pipeline.
+
+Why the gap is suspicious
+
+Your current results:
+
+CER = 0.0967
+WER = 0.3999
+
+That means character errors are relatively modest, but almost 4 in 10 whitespace-delimited tokens are being counted as wrong.
+
+For Bengali, this can happen because a tiny OCR error in a conjunct, ্, রেফ, য-ফলা, punctuation, etc. makes the entire word a WER error.
+
+For example, conceptually:
+
+Reference: রবীন্দ্রনাথ
+OCR:       রবিন্দ্রনাথ
+
+That's potentially only a small number of character edits, but WER says:
+
+wrong word = 1
+
+So WER can be disproportionately harsh.
+
+But I want you to check one thing
+
+Your WER currently does:
+
+hyp_words = hyp.split()
+ref_words = ref_norm.split()
+wer = _levenshtein(hyp_words, ref_words) / len(ref_words)
+
+This is whitespace-token WER.
+
+That's a perfectly legitimate conventional WER definition, but for Bengali literary OCR it may not be the most informative metric.
+
+I'd add word-level accuracy / normalized edit statistics, and inspect actual examples.
+
+For example, have your notebook print the 20 worst lines by WER:
+
+for r in sorted(results, key=lambda x: x["wer"], reverse=True)[:20]:
+    print("PAGE:", r["page_id"])
+    print("CER :", r["cer"])
+    print("WER :", r["wer"])
+    print("REF :", r["ref"])
+    print("HYP :", r["hyp"])
+    print("-" * 80)
+
+This will immediately tell us whether you're seeing:
+
+Case A — genuine OCR problems
+REF:  ...
+HYP:  ...
+
+with lots of completely incorrect Bengali words.
+
+Then yes, your OCR needs improvement.
+
+Case B — mostly tiny character differences
+REF:  রবীন্দ্রনাথের
+HYP:  রবীন্দ্রনাথের
+
+or small matra/conjunct differences across many words.
+
+Then your CER of ~9.7% is the more meaningful indicator, and the high WER is largely a consequence of Bengali orthographic sensitivity.
+
+Also: don't optimize your system specifically for WER yet
+
+Your actual project requirement is:
+
+Explainable Bengali literature retrieval with line-level citations.
+
+For that, I'd prioritize:
+
+1. CER
+2. Exact/near-exact line preservation
+3. Retrieval quality
+4. Citation correctness
+5. WER
+
+A system with:
+
+CER = 9.7%
+WER = 40%
+
+may still retrieve and cite the correct literary passage very effectively.
+
+But if you have:
+
+CER = 3%
+WER = 15%
+
+obviously that's better.
+
+So 40% WER is a warning signal, not automatically a failure.
+
+What I'd do next
+
+Don't change the OCR yet.
+
+First inspect the worst 20–50 lines and determine:
+
+Are the WER errors mostly caused by small Bengali character/conjunct errors, or are entire words genuinely wrong?
+
+If you show me the worst 10–20 REF/HYP/CER/WER pairs, I can tell you whether the 40% WER is genuinely bad or mostly an artifact of how WER behaves on your Bengali literary corpus.
+
+
+User: Line-level mean CER: 0.0967 Line-level mean WER: 0.3371 Page-level mean CER: 0.0953 Page-level mean WER: 0.3072 After making a few modifications, these are the results.
+
+Assistant:
+Ahh, this is noticeably better, especially the WER. 👍
+
+Current results — 11 pages
+Metric	Previous	Current	Change
+Line CER	0.0967	0.0967	—
+Line WER	0.3999	0.3371	↓ 15.7%
+Page CER	0.0999	0.0953	↓ 4.6%
+Page WER	0.3658	0.3072	↓ 16.0%
+
+So your modifications did improve the results, and importantly, the improvement is primarily in WER.
+
+What this tells us
+
+Your character-level accuracy hasn't changed:
+
+CER = 9.67%
+
+but word-level accuracy improved substantially:
+
+WER = 39.99% → 33.71%
+
+That suggests your modifications are helping with word formation/token boundaries or normalization, rather than fundamentally changing the character recognition quality.
+
+And your page-level results now look nicely consistent:
+
+Line CER   = 9.67%
+Page CER   = 9.53%
+
+Line WER   = 33.71%
+Page WER   = 30.72%
+
+That's much less concerning than the previous 40% line WER.
+
+Would I change the OCR again?
+
+Not yet.
+
+You've now got:
+
+11 pages
+↓
+CER ≈ 9.5–9.7%
+WER ≈ 30.7–33.7%
+
+I'd freeze this version temporarily and expand the evaluation set rather than continuously modifying the pipeline based on the same 11 pages.
+
+I'd aim for 30–50 gold pages and record the results cumulatively.
+
+For example:
+
+Pages    Line CER    Line WER
+5        8.46%       36.82%
+10      9.67%       33.71%
+
+
+If it eventually stabilizes around ~9–10% CER and ~30–35% WER, you'll have a much stronger empirical result.
+
+One thing I'd especially watch
+
+Since your CER is ~9.7% but WER is ~33.7%, I'd still inspect some worst-case lines. If most WER errors are caused by tiny Bengali character/conjunct differences, that's considerably less worrying than completely incorrect words.
+
+For your Decoding the Archives project, I'd present CER as the primary OCR metric and WER as a secondary metric, while emphasizing that the pipeline preserves line-level provenance for explainable retrieval/citations.
+
+So yes: the modification was beneficial. I would stop tweaking for now and add more representative gold pages.
+
+
+========================================================================
+REFLECTION
+========================================================================
+
+- What worked well:
+
+- What didn't work / had to be fixed manually:
+
+- Anything I disagreed with or changed after using it:
