@@ -421,15 +421,16 @@ def test_build_knowledge_base_blocked_by_enhance_stub_with_current_config(tmp_pa
     every test above calls chunk.split()/embed.encode()/store.build() directly and never exercises
     wiring.register_all()/hooks.run() at all, so none of them would ever catch this.
 
-    configs/config.yaml currently has enhance.enabled: true, so pipeline.py's
-    enhance.run(pages, cfg) (Stage 1, called before even hooks.AFTER_INGEST) unconditionally calls
-    Enhancer(cfg).apply(pages), which is still `raise NotImplementedError("Stage 1: apply
-    enhancer")`. This is the FIRST of two stub blockers standing between the real entry point and
-    a successful real corpus build -- see test_build_knowledge_base_blocked_by_pii_stub_once_
-    enhance_disabled below for the second. Neither is index/chunk/embed/store's file to fix (DP-3,
-    cross-team, raised with the team) -- this test exists purely to make the failure cheap and
-    reliable to hit locally, instead of only surfacing during the expensive real 437-page corpus
-    run (which also can't happen in this environment yet -- see DP-1, no Tesseract installed)."""
+    configs/config.yaml now has enhance.enabled: false (Enhancer's VAE/diffusion stage is bonus-
+    only -- gated to data speciality E1 "severely degraded scans", which this group did not
+    choose; we chose E26 "dirty-ocr", built in index/chunk.py -- so it was turned off rather than
+    implemented). This test's own cfg still sets enhance.enabled=True regardless of the live
+    config value, to pin Enhancer.apply()'s stub behaviour (`raise NotImplementedError("Stage 1:
+    apply enhancer")`) as a permanent regression check: if anyone re-enables this bonus stage
+    without implementing it, the failure should stay cheap and obvious to hit locally, not only
+    surface during an expensive real corpus run. Not index/chunk/embed/store's file to fix if it
+    ever needs a real implementation -- see test_build_knowledge_base_blocked_by_pii_stub_once_
+    enhance_disabled below for the second (now-fixed) stub blocker on this same real entry point."""
     raw_dir = tmp_path / "data" / "raw" / "testwork"
     raw_dir.mkdir(parents=True)
     # A blank white image is fine here: Enhancer.apply() raises unconditionally, before it would
@@ -444,7 +445,8 @@ def test_build_knowledge_base_blocked_by_enhance_stub_with_current_config(tmp_pa
             "processed_dir": str(tmp_path / "data" / "processed"),
             "index_dir": str(tmp_path / "data" / "processed" / "index"),
         },
-        # enhance.enabled: True matches the live configs/config.yaml, on purpose.
+        # enhance.enabled: True regardless of the live configs/config.yaml (now False) -- pins
+        # Enhancer.apply()'s stub behaviour as a permanent regression check (see docstring).
         "enhance": {"enabled": True, "model": "unet_small", "type": "diffusion"},
         # wiring.register_all() eagerly constructs agent/guardrails.py::Guardrails(cfg), which
         # reads cfg["agent"] in __init__ even though guardrails' own logic (ON_TOOL_CALL) never
@@ -466,14 +468,20 @@ def test_build_knowledge_base_blocked_by_pii_stub_once_enhance_disabled(tmp_path
     dependency: this machine has no Tesseract install (DP-1), and that's irrelevant to what's
     under test here anyway -- test_ocr.py already covers real OCR behaviour on machines that do
     have it. The point of THIS test is proving wiring.register_all()'s AFTER_OCR registration
-    (governance/pii.py::register._scrub) actually fires when the real entry point runs.
-
-    Once governance/pii.py is implemented for real (DP-3, cross-team), flip this test's
-    expectation from "raises" to "runs clean through store.build()" -- do not leave this
-    permanently asserting a crash once the underlying bug is fixed."""
+    (governance/pii.py::register._scrub) actually fires when the real entry point runs, and that
+    it actually redacts -- governance/pii.py is now implemented for real (was DP-3's second
+    cross-team blocker), so this asserts a clean run through store.build() instead of a crash, and
+    plants a fake email in the canned OCR output to prove _scrub's redaction survives into the
+    persisted chunks.jsonl (not just that build_knowledge_base() didn't raise)."""
     raw_dir = tmp_path / "data" / "raw" / "testwork"
     raw_dir.mkdir(parents=True)
-    Image.new("L", (50, 50), color=255).save(raw_dir / "1.png")
+    # Unlike the sibling test above (where Enhancer.apply() raises before ever looking at pixel
+    # content), this run reaches preprocess.run()'s blank-page filter for real -- a page dropped
+    # there never gets processed_dir created, which chunk.split() needs to exist later. A plain
+    # white image would be dropped, so paint a small dark block to clear the ink-ratio threshold.
+    img = Image.new("L", (50, 50), color=255)
+    img.paste(0, (10, 10, 40, 40))
+    img.save(raw_dir / "1.png")
 
     cfg = {
         "paths": {
@@ -483,18 +491,14 @@ def test_build_knowledge_base_blocked_by_pii_stub_once_enhance_disabled(tmp_path
         },
         "enhance": {"enabled": False, "model": "unet_small", "type": "diffusion"},
         "agent": {},  # see the sibling test above for why wiring.register_all() needs this key
-        # Not reached until governance/pii.py is implemented and this test's expectation flips
-        # (see docstring) -- kept here now so that future flip doesn't also require re-deriving a
-        # working cfg for the rest of the pipeline (chunk.split/embed.encode/store.build) from
-        # scratch.
-        "index": {"chunk_tokens": 50, "overlap": 5},
+        "index": {"chunk_tokens": 50, "overlap": 5, "type": "faiss:flat"},
         "embed": {"model": "intfloat/multilingual-e5-base", "batch_size": 2},
         "device": "cpu",
     }
-    # Canned, deterministic output -- content is irrelevant here, only that hooks.AFTER_OCR fires
-    # with *something* next. pipeline.py imports `layout`/`ocr` as modules (not their functions),
-    # so patching the attribute on the module object patches what pipeline.build_knowledge_base()
-    # actually calls.
+    # Canned, deterministic output -- content is irrelevant except the planted email, which is
+    # only there to prove AFTER_OCR's PII scrub actually ran. pipeline.py imports `layout`/`ocr` as
+    # modules (not their functions), so patching the attribute on the module object patches what
+    # pipeline.build_knowledge_base() actually calls.
     monkeypatch.setattr(
         pipeline.layout,
         "detect",
@@ -507,11 +511,17 @@ def test_build_knowledge_base_blocked_by_pii_stub_once_enhance_disabled(tmp_path
             Chunk(
                 id="testwork_p0001_l000",
                 doc_id="testwork",
-                text="line",
+                text="line, contact rabi@example.com for details",
                 page_ids=["testwork_p0001"],
             )
         ],
     )
+    fake_model = _FakeEmbedModel(dim=8)
+    monkeypatch.setattr(embed, "_load_model", lambda model_name, device: fake_model)
 
-    with pytest.raises(NotImplementedError, match="PII"):
-        pipeline.build_knowledge_base(cfg)
+    pipeline.build_knowledge_base(cfg)
+
+    faiss_index, chunk_rows = store.load(cfg)
+    assert faiss_index.ntotal == len(chunk_rows) == 1
+    assert "rabi@example.com" not in chunk_rows[0]["text"]
+    assert "[REDACTED_EMAIL]" in chunk_rows[0]["text"]
