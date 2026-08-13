@@ -32,6 +32,8 @@ _DEFAULT_MIN_LINE_CHARS = 1   # reject only genuinely empty OCR output by defaul
                               # often need several Unicode codepoints, so a stricter default risks
                               # rejecting legitimate short lines (page numbers, single-word headings).
                               # Raise cfg['ocr']['min_line_chars'] once real noise patterns are visible.
+_DEFAULT_MAX_LINE_DIFF = 2         # overridable via cfg['ocr']['max_line_diff'] -- see _align_lines
+_DEFAULT_MIN_LINE_SIMILARITY = 0.5  # overridable via cfg['ocr']['min_line_similarity']
 
 
 def _image_path_for_page(page_id: str, cfg: dict) -> Path:
@@ -42,24 +44,33 @@ def _image_path_for_page(page_id: str, cfg: dict) -> Path:
 
 def _load_gold_page_texts(cfg: dict) -> dict[str, str]:
     """page_id -> its human-verified page text from grading_kit/labels.jsonl (raw, not yet split into
-    lines or normalized — that happens per-page in _align_reference_lines, same as the IA reference)."""
+    lines or normalized — that happens per-page in _align_lines, same as the IA reference).
+
+    labels_path may be a single JSONL file (the original grading_kit/labels.jsonl convention) or a
+    directory of per-work JSONL files sharing the same {"page_id": ..., "text": ...} row shape (e.g.
+    one file per literary work) -- every *.jsonl directly inside it is read and merged. Directory
+    support exists because a single work's full-page gold transcriptions are naturally produced and
+    stored one file per work, not hand-merged into one file; falling back to open()-ing a directory
+    would otherwise raise IsADirectoryError."""
     labels_path = Path(cfg.get("grading_kit", {}).get("labels_path", "grading_kit/labels.jsonl"))
     texts: dict[str, str] = {}
     if not labels_path.exists():
         return texts
-    with open(labels_path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            pid = row.get("page_id")
-            text = row.get("text", "")
-            if pid and text and not text.startswith("REPLACE ME"):  # skip the un-filled stub row
-                texts[pid] = text
+    jsonl_files = sorted(labels_path.glob("*.jsonl")) if labels_path.is_dir() else [labels_path]
+    for jsonl_file in jsonl_files:
+        with open(jsonl_file, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                pid = row.get("page_id")
+                text = row.get("text", "")
+                if pid and text and not text.startswith("REPLACE ME"):  # skip the un-filled stub row
+                    texts[pid] = text
     return texts
 
 
@@ -82,30 +93,110 @@ def _load_layout_region_lookup(cfg: dict) -> dict[str, dict]:
     return lookup
 
 
-def _align_reference_lines(raw_text: str, expected_n_lines: int, source: str, page_id: str) -> list[str] | None:
-    """Split a reference text blob into lines and check it against the detected region count for this
-    page. Alignment is refused (returns None) unless the counts match EXACTLY — positional line-to-line
-    correspondence is only trustworthy when both sides agree on how many physical lines exist; even a
-    1-line difference means everything after the divergence point is compared against the wrong line.
-    (This is still a real limitation even at an exact count match: IA could split/merge lines
-    differently in a way that happens to net out to the same total. A true per-line sequence alignment
-    — e.g. the Levenshtein-projection approach A1's notebook describes for gold-set construction — is a
-    heavier batch job better suited to an offline script, not this per-page hot path.)
-    """
-    lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
-    if not lines or expected_n_lines == 0:
-        return None
-    if len(lines) != expected_n_lines:
+def _split_reference_lines(raw_text: str) -> list[str]:
+    """Split a reference/gold text blob into non-blank physical lines. Raw — not yet aligned to a
+    page's detected regions; see _align_lines for that."""
+    return [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+
+
+def _line_similarity(a: str, b: str) -> float:
+    """Character-level similarity in [0, 1] (1.0 = identical), the mirror image of _cer — used to
+    SCORE a candidate line-to-line pairing during alignment, as opposed to _cer's job of scoring an
+    already-aligned pair's quality. Two empty strings are trivially identical; one empty and one
+    non-empty are trivially unrelated (handled by the max(...,1) floor, giving distance/len == 1)."""
+    if not a and not b:
+        return 1.0
+    return 1.0 - (_levenshtein(a, b) / max(len(a), len(b), 1))
+
+
+def _align_lines(
+    hyp_lines: list[str],
+    ref_lines: list[str] | None,
+    page_id: str,
+    source: str,
+    max_line_diff: int = _DEFAULT_MAX_LINE_DIFF,
+    min_similarity: float = _DEFAULT_MIN_LINE_SIMILARITY,
+) -> dict[int, str]:
+    """Map hyp-line index -> its aligned reference/gold line text (raw; callers normalize same as
+    before). Returns {} if there's nothing to align or alignment is refused.
+
+    Exact line-count match: trivial 1:1 positional mapping, same behaviour as before this fix.
+
+    A line-count difference of up to `max_line_diff`: runs a small Needleman-Wunsch-style dynamic
+    program over per-line similarity (_line_similarity, i.e. a Levenshtein ratio) to find the
+    best-scoring correspondence between the two sequences, treating a skipped hyp or ref line as a
+    zero-cost gap. This is the "Levenshtein-projection approach" this function's own previous
+    docstring deferred as future work — content-based, not a naive index shift: an extra/missing
+    physical line (e.g. a running header transcribed as one gold line when it's two separate visual
+    regions, or vice versa) is absorbed as a gap instead of silently misaligning every line after
+    it, because each candidate pairing is scored by how alike the two lines actually ARE, not just
+    by position. A pairing scoring below `min_similarity` is dropped rather than forced — better to
+    leave a line unmatched (falls through to rejection) than mis-attribute it to the wrong gold/ref
+    line. Lines with no aligned counterpart are simply absent from the returned mapping; the caller
+    treats those exactly like "no gold/reference available" (evidence_tier='raw').
+
+    A bigger difference than `max_line_diff` still refuses alignment entirely, unchanged from
+    before: past a small gap, positional/content drift is too likely for even a similarity-scored
+    match to be trustworthy across a whole page (e.g. a prose paragraph transcribed as one gold
+    "line" against a dozen wrapped visual lines — no per-line correspondence exists to recover)."""
+    n_hyp = len(hyp_lines)
+    if n_hyp == 0 or not ref_lines:
+        return {}
+    n_ref = len(ref_lines)
+
+    if n_hyp == n_ref:
+        return dict(enumerate(ref_lines))
+
+    if abs(n_hyp - n_ref) > max_line_diff:
         logger.warning(
-            f"page {page_id}: {source} has {len(lines)} lines vs. {expected_n_lines} detected regions "
-            f"— refusing positional alignment (exact match required)"
+            f"page {page_id}: {source} has {n_ref} lines vs. {n_hyp} detected regions "
+            f"— refusing alignment (difference > {max_line_diff})"
         )
-        return None
-    return lines
+        return {}
+
+    hyp_norm = [_normalize(h) for h in hyp_lines]
+    ref_norm = [_normalize(r) for r in ref_lines]
+
+    # dp[i][j] = best cumulative similarity aligning hyp[:i] to ref[:j]. Zero-cost gaps let the DP
+    # freely skip a hyp or ref line, which is exactly how a small extra/missing line gets absorbed.
+    dp = [[0.0] * (n_ref + 1) for _ in range(n_hyp + 1)]
+    back = [[""] * (n_ref + 1) for _ in range(n_hyp + 1)]
+    for i in range(1, n_hyp + 1):
+        back[i][0] = "up"
+    for j in range(1, n_ref + 1):
+        back[0][j] = "left"
+    for i in range(1, n_hyp + 1):
+        for j in range(1, n_ref + 1):
+            diag = dp[i - 1][j - 1] + _line_similarity(hyp_norm[i - 1], ref_norm[j - 1])
+            up = dp[i - 1][j]
+            left = dp[i][j - 1]
+            best = max(diag, up, left)
+            dp[i][j] = best
+            back[i][j] = "diag" if best == diag else ("up" if best == up else "left")
+
+    mapping: dict[int, str] = {}
+    i, j = n_hyp, n_ref
+    while i > 0 and j > 0:
+        step = back[i][j]
+        if step == "diag":
+            if _line_similarity(hyp_norm[i - 1], ref_norm[j - 1]) >= min_similarity:
+                mapping[i - 1] = ref_lines[j - 1]
+            i, j = i - 1, j - 1
+        elif step == "up":
+            i -= 1
+        else:
+            j -= 1
+
+    logger.info(
+        f"page {page_id}: {source} has {n_ref} lines vs. {n_hyp} detected regions "
+        f"— fuzzy-aligned {len(mapping)}/{n_hyp} lines (difference <= {max_line_diff})"
+    )
+    return mapping
 
 
-def _load_page_reference_lines(page_id: str, cfg: dict, expected_n_lines: int) -> list[str] | None:
-    """Best-effort IA silver-reference lines for a page, for the CER gate.
+def _load_page_reference_lines(page_id: str, cfg: dict) -> list[str] | None:
+    """Best-effort IA silver-reference lines for a page, for the CER gate. Raw — not yet aligned to
+    this page's detected region count; see _align_lines for that (called by transcribe()).
 
     Convention: data/raw/<doc_id>/<page_id>.ref.txt, one line per physical line, same top-to-bottom
     order as our own detected regions. NOTE: scripts/get_data.sh does not fetch this today — nothing in
@@ -124,7 +215,7 @@ def _load_page_reference_lines(page_id: str, cfg: dict, expected_n_lines: int) -
     if not ref_path.exists():
         return None
     raw_text = open(ref_path, encoding="utf-8").read()
-    return _align_reference_lines(raw_text, expected_n_lines, "IA reference", page_id)
+    return _split_reference_lines(raw_text) or None
 
 
 def _normalize(text: str) -> str:
@@ -231,18 +322,26 @@ def transcribe(regions: list[Region], cfg: dict) -> list[Chunk]:
          override that doubt.
       2. Too-short check — REJECT_TOO_SHORT, universal, before any tier branch.
       3. Gold check — if this page has a human-verified text in grading_kit/labels.jsonl, and this
-         specific line's OCR output exactly matches (CER==0.0) the correspondingly-aligned gold line,
-         accept as "gold". A page being in labels.jsonl is NOT enough by itself; that only proves a
-         human verified the page's text, not that OUR OCR of this exact line matches it.
+         specific line's OCR output exactly matches (CER==0.0) its aligned gold line, accept as "gold".
+         A page being in labels.jsonl is NOT enough by itself; that only proves a human verified the
+         page's text, not that OUR OCR of this exact line matches it. Alignment (which gold line, if
+         any, corresponds to which detected region) is content-aware, not purely positional — see
+         _align_lines: an exact line-count match aligns positionally as before, a small (<=
+         cfg['ocr']['max_line_diff'], default 2) mismatch aligns by per-line similarity, and lines with
+         no aligned counterpart simply have no gold line here (fall through to check 4, same as a page
+         with no gold label at all).
       4. Standard silver/raw gate — CER against the IA reference, accept as "silver" if <= max_cer_target,
          else reject as cer_above_threshold. This is also where a gold-page line falls if it didn't earn
          gold (e.g. Tesseract misread that one line) — it is NOT auto-rejected just for missing gold.
+         The IA reference is aligned the same content-aware way as the gold text (check 3).
     """
     reader = Reader(cfg)
     gold_texts = _load_gold_page_texts(cfg)
     ocr_cfg = cfg.get("ocr", {})
     max_cer = ocr_cfg.get("max_cer_target", _DEFAULT_MAX_CER)
     min_chars = ocr_cfg.get("min_line_chars", _DEFAULT_MIN_LINE_CHARS)
+    max_line_diff = ocr_cfg.get("max_line_diff", _DEFAULT_MAX_LINE_DIFF)
+    min_line_similarity = ocr_cfg.get("min_line_similarity", _DEFAULT_MIN_LINE_SIMILARITY)
     layout_lookup = _load_layout_region_lookup(cfg)
     ocr_config_str = reader.ocr_config_string()
 
@@ -259,16 +358,29 @@ def transcribe(regions: list[Region], cfg: dict) -> list[Chunk]:
 
     for page_id, page_regions in by_page.items():
         doc_id = page_id.rsplit("_p", 1)[0]
-        n = len(page_regions)
-        ref_lines = _load_page_reference_lines(page_id, cfg, expected_n_lines=n)
+
+        # OCR every region on this page up front — needed both for the per-region loop below AND
+        # for content-aware gold/silver line alignment when the detected region count doesn't
+        # exactly match the reference's line count (each region is still OCR'd exactly once).
+        ocr_results = [reader._ocr_line(reader._crop(region)) for region in page_regions]
+        hyp_lines = [text for text, _conf in ocr_results]
+
+        ref_lines_raw = _load_page_reference_lines(page_id, cfg)
         gold_text = gold_texts.get(page_id)
-        gold_lines = _align_reference_lines(gold_text, n, "gold label", page_id) if gold_text else None
+        gold_lines_raw = _split_reference_lines(gold_text) if gold_text else None
+
+        gold_alignment = _align_lines(
+            hyp_lines, gold_lines_raw, page_id, "gold label", max_line_diff, min_line_similarity
+        )
+        ref_alignment = _align_lines(
+            hyp_lines, ref_lines_raw, page_id, "IA reference", max_line_diff, min_line_similarity
+        )
 
         for idx, region in enumerate(page_regions):
             region_id = f"{page_id}_r{idx:03d}"
             chunk_id = f"{page_id}_l{idx:03d}"
 
-            raw_text, conf = reader._ocr_line(reader._crop(region))
+            raw_text, conf = ocr_results[idx]
             norm_text = _normalize(raw_text)
 
             row = {
@@ -312,7 +424,7 @@ def transcribe(regions: list[Region], cfg: dict) -> list[Chunk]:
 
             # 3. Gold check — requires an exact (CER==0.0) match against the aligned gold line, not
             # merely being on a page that has SOME gold label.
-            gold_line = gold_lines[idx] if gold_lines is not None and idx < len(gold_lines) else None
+            gold_line = gold_alignment.get(idx)
             gold_norm = _normalize(gold_line) if gold_line else ""
             if gold_norm:
                 gold_cer = _cer(norm_text, gold_norm)
@@ -328,7 +440,7 @@ def transcribe(regions: list[Region], cfg: dict) -> list[Chunk]:
                 # missing gold (even on a gold-reviewed page) is not an automatic rejection.
 
             # 4. Standard silver/raw gate against the IA reference.
-            ref_line = ref_lines[idx] if ref_lines is not None and idx < len(ref_lines) else None
+            ref_line = ref_alignment.get(idx)
             ref_norm = _normalize(ref_line) if ref_line else ""
             if not ref_norm:
                 row["reject_reason"] = "reference_alignment_failed"

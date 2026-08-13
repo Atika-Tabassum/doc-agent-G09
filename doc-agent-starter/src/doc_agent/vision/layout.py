@@ -14,6 +14,14 @@ logger = get_logger(__name__)
 
 _LAYOUT_META = "layout_meta.jsonl"
 _MIN_Y_TOLERANCE_PX = 5
+# Noise-region floor: a genuine text line at typical scan DPI (see A1's 300 DPI corpus) is never
+# this small -- even a lone short glyph (a page number digit, a punctuation mark) clears both of
+# these comfortably. Real specks/dust/print defects that Tesseract occasionally boxes as a "word"
+# sit well below them. Conservative by design: tuned to drop only unambiguous noise, not to force
+# detected-line counts to match a particular gold transcription's line count (see vision/ocr.py's
+# _align_lines for the part of this fix that handles genuine near-miss count differences).
+_MIN_LINE_HEIGHT_PX = 8
+_MIN_LINE_AREA_PX = 40
 
 
 def _tess_config(cfg: dict) -> tuple[str, str]:
@@ -23,9 +31,21 @@ def _tess_config(cfg: dict) -> tuple[str, str]:
     psm = ocr_cfg.get("psm", 4)
     return lang, f"--oem {oem} --psm {psm}"
 
-def _group_words_into_lines(data: dict, score_thr: float) -> list[dict]:
+def _group_words_into_lines(
+    data: dict,
+    score_thr: float,
+    min_height_px: float = _MIN_LINE_HEIGHT_PX,
+    min_area_px: float = _MIN_LINE_AREA_PX,
+) -> list[dict]:
     """Group Tesseract's word-level boxes into lines by (block_num, par_num, line_num),
-    preserving that provenance triple on every grouped line for the traceability sidecar."""
+    preserving that provenance triple on every grouped line for the traceability sidecar.
+
+    Drops two kinds of spurious "lines" before they ever reach layout_meta.jsonl / a Region:
+    low mean-confidence groups (score_thr, unchanged) and groups whose merged bbox is smaller
+    than min_height_px/min_area_px -- scan noise (ink specks, print defects) that Tesseract
+    occasionally boxes as a low-word-count "line" distinct from any real text line, which would
+    otherwise inflate the detected line count above what a human (or a gold transcription) would
+    count."""
     lines: dict[tuple[int, int, int], dict] = {}
     n = len(data["text"])
     for i in range(n):
@@ -52,6 +72,10 @@ def _group_words_into_lines(data: dict, score_thr: float) -> list[dict]:
     for line in lines.values():
         mean_conf = (sum(line["confs"]) / len(line["confs"]) / 100.0) if line["confs"] else 0.0
         if mean_conf < score_thr:
+            continue
+        height = line["y1"] - line["y0"]
+        width = line["x1"] - line["x0"]
+        if height < min_height_px or (width * height) < min_area_px:
             continue
         line["bbox"] = (line["x0"], line["y0"], line["x1"] - line["x0"], line["y1"] - line["y0"])
         line["center_y"] = line["y0"] + (line["y1"] - line["y0"]) / 2.0
@@ -99,7 +123,10 @@ def _spatial_reading_order(lines: list[dict], y_tolerance: float) -> list[dict]:
 def detect(pages: list[Page], cfg: dict) -> list[Region]:
     """Detect text-line regions per page in correct reading order and save layout_meta.jsonl."""
     lang, config = _tess_config(cfg)
-    score_thr = cfg.get("layout", {}).get("score_thr", 0.0)
+    layout_cfg = cfg.get("layout", {})
+    score_thr = layout_cfg.get("score_thr", 0.0)
+    min_line_height_px = layout_cfg.get("min_line_height_px", _MIN_LINE_HEIGHT_PX)
+    min_line_area_px = layout_cfg.get("min_line_area_px", _MIN_LINE_AREA_PX)
     processed_dir = Path(cfg.get("paths", {}).get("processed_dir", "data/processed"))
 
     regions: list[Region] = []
@@ -111,7 +138,7 @@ def detect(pages: list[Page], cfg: dict) -> list[Region]:
             raise FileNotFoundError(f"could not read image for page {page.id} at {page.image_path}")
 
         data = pytesseract.image_to_data(img, lang=lang, config=config, output_type=Output.DICT)
-        lines = _group_words_into_lines(data, score_thr)
+        lines = _group_words_into_lines(data, score_thr, min_line_height_px, min_line_area_px)
 
         y_tolerance = _y_tolerance(lines, cfg)
         ordered_lines = _spatial_reading_order(lines, y_tolerance)
