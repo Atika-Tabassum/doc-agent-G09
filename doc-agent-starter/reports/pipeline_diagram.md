@@ -46,9 +46,9 @@ flowchart LR
     class S1a done
 
     subgraph S1b["Stage 1b — Enhance<br/>ingest/enhance.py"]
-        E1["run(pages, cfg)<br/>Enhancer(cfg).apply(pages)<br/>enhance.enabled: true in config.yaml"]
+        E1["run(pages, cfg)<br/>enhance.enabled: false in config.yaml<br/>→ no-op passthrough, Enhancer never called"]
     end
-    class S1b blocked
+    class S1b done
 
     HOOK1(["hooks.run(AFTER_INGEST, …)<br/>0 handlers registered — no-op today"])
 
@@ -62,8 +62,8 @@ flowchart LR
     end
     class S3 done
 
-    HOOK2(["hooks.run(AFTER_OCR, …)<br/>governance/pii.py::_scrub registered<br/>⛔ raise NotImplementedError"])
-    class HOOK2 blocked
+    HOOK2(["hooks.run(AFTER_OCR, …)<br/>governance/pii.py::_scrub registered<br/>redacts Chunk.text in place (email/phone/ID-number)"])
+    class HOOK2 done
 
     subgraph S4a["Stage 4a — Chunk (mine)<br/>index/chunk.py"]
         C4["split(chunks, cfg)<br/>sliding window, chunk_tokens=256/overlap=32<br/>→ list[Chunk] (merged) + chunk_meta.jsonl"]
@@ -87,13 +87,16 @@ flowchart LR
     RAW --> L0 --> P1 --> E1 --> HOOK1 --> D2 --> T3 --> HOOK2 --> C4 --> HOOK3 --> M4 --> B4 --> OUT
 ```
 
-**Reading this diagram honestly:** the red boxes are not hypothetical — `tests/test_retrieval.py`'s
-`test_build_knowledge_base_blocked_by_enhance_stub_with_current_config` and
-`test_build_knowledge_base_blocked_by_pii_stub_once_enhance_disabled` (Milestone 18) prove, right
-now, that a call to `pipeline.build_knowledge_base(cfg)` with the live `config.yaml` never actually
-reaches Stage 4a. It dies inside Stage 1b first. This diagram is drawn to show the whole intended
-chain, with the two real breakpoints marked exactly where they are — not to imply the pipeline
-currently runs end-to-end, which it does not (see DP-3 in the plan).
+**Reading this diagram honestly (updated after DP-3's resolution):** `pipeline.build_knowledge_base(cfg)`
+with the live `config.yaml` now runs the whole chain above end-to-end — Stage 1b's Enhancer is a
+bonus stage (gated to data speciality E1 "severely degraded scans", which this group didn't choose;
+we chose E26 "dirty-ocr", built in Stage 4a) and was disabled via `enhance.enabled: false` rather
+than implemented, and `governance/pii.py` now has a real `detect()`/`redact()`/`_scrub` implementation.
+`tests/test_retrieval.py`'s `test_build_knowledge_base_blocked_by_enhance_stub_with_current_config`
+still pins `Enhancer.apply()`'s stub behaviour as a regression check (in case anyone re-enables it
+without implementing it) but no longer reflects the live config; its sibling,
+`test_build_knowledge_base_blocked_by_pii_stub_once_enhance_disabled`, now asserts a clean run
+through `store.build()` with a planted PII string confirmed redacted in the persisted `chunks.jsonl`.
 
 ---
 
@@ -192,14 +195,14 @@ precisely because an entire document could theoretically be preprocessed down to
 pages (or zero accepted OCR lines — see 2.4), and Stage 4 has to tolerate an empty `by_doc[doc_id]`
 list without crashing.
 
-### 2.2 Stage 1b — Enhance (`ingest/enhance.py::run`) — ⛔ currently blocked (DP-3)
+### 2.2 Stage 1b — Enhance (`ingest/enhance.py::run`) — ✅ disabled by design, not blocked
 
 ```mermaid
 flowchart TD
     A["run(pages, cfg)"] --> B{"cfg['enhance']['enabled']?"}
-    B -->|false| C["return pages unchanged<br/>(no-op passthrough)"]
-    B -->|true — LIVE VALUE IN config.yaml| D["Enhancer(cfg).apply(pages)"]
-    D --> E["⛔ raise NotImplementedError<br/>'Stage 1: apply enhancer'"]
+    B -->|false — LIVE VALUE IN config.yaml| C["return pages unchanged<br/>(no-op passthrough)"]
+    B -->|true| D["Enhancer(cfg).apply(pages)"]
+    D --> E["⛔ raise NotImplementedError<br/>'Stage 1: apply enhancer' (stub, unchanged)"]
 
     classDef done fill:#1b4332,stroke:#40916c,color:#d8f3dc
     classDef blocked fill:#5c1a1a,stroke:#e63946,color:#ffe5e5
@@ -207,12 +210,18 @@ flowchart TD
     class D,E blocked
 ```
 
-**This is DP-3's first breakpoint, confirmed by `test_build_knowledge_base_blocked_by_enhance_stub_with_current_config`
-(Milestone 18).** With `enhance.enabled: true` (the live value in `configs/config.yaml:5`), every
-call to `pipeline.build_knowledge_base(cfg)` dies here — before `hooks.AFTER_INGEST` even fires,
-before Stage 2/3/4 ever run. Not `ingest/enhance.py`'s file to fix (out of Person C's scope) — but
-the diagram has to be honest that this is where the real chain currently stops, since drawing a
-clean unbroken arrow through this box would misrepresent the repo's actual state.
+**Formerly DP-3's first breakpoint, now resolved — by disabling, not implementing.**
+`ingest/enhance.py`'s VAE/diffusion `Enhancer` is a bonus stage: `handbook/05-Codebase-Guide.md`'s
+A2 tier list does not include it in ⭐ Core, and only lists it under ▲ data-speciality **E1**
+("severely degraded scans") as an additional ➕ bonus on top of E1's own requirement — a speciality
+this group didn't choose (we chose **E26** "dirty-ocr", built in Stage 4a/`index/chunk.py`). So
+`configs/config.yaml:5` was changed to `enhance.enabled: false` rather than building a generative
+model the assignment doesn't gate for this group. `Enhancer.train()`/`apply()` remain
+`NotImplementedError` stubs — same convention as an unused `optional/` module —
+and `test_build_knowledge_base_blocked_by_enhance_stub_with_current_config` still pins that stub
+behaviour as a regression check (path D→E above), in case anyone re-enables this bonus stage
+without implementing it. The live path is A→B→C: every real call now proceeds straight through to
+`hooks.AFTER_INGEST` and Stage 2.
 
 ### 2.3 Stage 2 — Layout (`vision/layout.py::detect`)
 
@@ -461,7 +470,7 @@ index has no independent way to verify it — it just trusts `chunk_rows[faiss_s
 
 ---
 
-## 3. Cross-cutting hooks & wiring — where the real chain currently breaks
+## 3. Cross-cutting hooks & wiring — DP-3 resolved, the real chain now runs end-to-end
 
 ```mermaid
 sequenceDiagram
@@ -471,6 +480,7 @@ sequenceDiagram
     participant PII as governance/pii.py
     participant GD as agent/guardrails.py
     participant EN as ingest/enhance.py
+    participant C4 as index/chunk.py (mine)
 
     PL->>WR: register_all(cfg)
     WR->>HK: hooks.clear()
@@ -485,18 +495,20 @@ sequenceDiagram
     PL->>PL: pages = loader.load_pages(cfg)
     PL->>PL: pages = preprocess.run(pages, cfg)
     PL->>EN: pages = enhance.run(pages, cfg)
-    EN->>EN: cfg.enhance.enabled == true (live config.yaml)
-    EN-->>PL: ⛔ raise NotImplementedError (Stage 1 - apply enhancer)
-    Note over PL,EN: DP-3 BREAKPOINT #1 — every real call dies HERE.<br/>hooks.AFTER_INGEST is never even reached.
+    EN->>EN: cfg.enhance.enabled == false (live config.yaml)
+    EN-->>PL: ✅ return pages unchanged (no-op passthrough)
+    Note over PL,EN: Former BREAKPOINT #1 — bonus stage disabled via config,<br/>not implemented (not gated for this group's E26 speciality).
 
-    Note over PL,PII: --- everything below only happens if<br/>enhance.enabled is set False for testing (Milestone 18) ---
     PL->>PL: hooks.run(AFTER_INGEST, …) — 0 handlers, no-op
     PL->>PL: regions = layout.detect(pages, cfg)
     PL->>PL: text = ocr.transcribe(regions, cfg)
     PL->>HK: hooks.run(AFTER_OCR, {"chunks": text})
     HK->>PII: _scrub(ctx)
-    PII-->>HK: ⛔ raise NotImplementedError (PII - redact text/answer/log in ctx)
-    Note over HK,PII: DP-3 BREAKPOINT #2 — reached only once<br/>breakpoint #1 is bypassed. chunk.split()<br/>(mine) is STILL never called.
+    PII->>PII: mutate each Chunk.text in place<br/>(redact() -- email/phone/ID-number spans)
+    PII-->>HK: ✅ ctx returned (mutation already applied to `text`)
+    Note over HK,PII: Former BREAKPOINT #2 — governance/pii.py is now implemented.<br/>Mutates in place, not via a returned copy: pipeline.py discards<br/>hooks.run()'s return value at every seam it calls, so a rebuilt<br/>copy would be silently thrown away and never take effect.
+    PL->>C4: chunks = chunk.split(text, cfg)
+    Note over PL,C4: chunk.split() now receives real, already-redacted<br/>Chunk objects — the real chain reaches Stage 4a-4c for real.
 ```
 
 **Why `logging_conf.py`'s stub is *not* on this diagram as a breakpoint:** it's tempting to assume
@@ -548,9 +560,11 @@ pipeline diagram has to draw what the code *does*, not what `config.yaml`'s `mod
 |---|---|---|---|
 | `ocr.model` | `"microsoft/trocr-base-printed"` | `pytesseract` (Tesseract-ben) unconditionally, regardless of this value | OCR/vision |
 | `layout.model` | `"detectron2:layout"` | `pytesseract.image_to_data` word/line grouping — no Detectron2 import anywhere in `layout.py` | OCR/vision |
-| `enhance.enabled` (live value) | `true` | `configs/design_choices.md`'s Stage 1 row still documents `false` | Ingest (doc, not code) |
 
-This diagram's Section 1/2 boxes are drawn against **the real code path** (Tesseract, `enhance.enabled: true`)
+(Resolved: `enhance.enabled` used to drift against `design_choices.md`'s Stage 1 row — both now
+consistently say `false`, so that row has been removed rather than left as stale history.)
+
+This diagram's Section 1/2 boxes are drawn against **the real code path** (Tesseract, `enhance.enabled: false`)
 in every case above — not against the config file's `model:` strings, which would misrepresent what
 actually executes.
 
