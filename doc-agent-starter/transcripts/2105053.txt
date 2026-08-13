@@ -766,6 +766,310 @@ The **most important conceptual statement for your Stage 2 design** is:
 That is the distinction your current implementation captures, and it is the right one for the Bengali literary corpus you've described.
 
 
+User: Why do we need line alignment at all? Why can't we just compare reference line 1 with OCR line 1, line 2 with line 2, etc.?
+
+Assistant:
+Because OCR does not guarantee that its line boundaries will be the same as the reference text's line boundaries.
+
+Our reference and OCR can contain the same text, but organized into different numbers of lines.
+
+Simple example
+
+Suppose the reference says:
+
+Reference line 1:
+রবীন্দ্রনাথ ঠাকুর বাংলা সাহিত্যের একজন
+
+Reference line 2:
+বিশিষ্ট কবি ও সাহিত্যিক।
+
+But OCR produces:
+
+OCR line 1:
+রবীন্দ্রনাথ ঠাকুর বাংলা সাহিত্যের
+
+OCR line 2:
+একজন বিশিষ্ট কবি ও সাহিত্যিক।
+
+The OCR has effectively shifted the line boundary.
+
+If we compare by position:
+
+reference line 1 ↔ OCR line 1
+reference line 2 ↔ OCR line 2
+
+we get:
+
+Reference: রবীন্দ্রনাথ ঠাকুর বাংলা সাহিত্যের একজন
+OCR:       রবীন্দ্রনাথ ঠাকুর বাংলা সাহিত্যের
+
+Reference: বিশিষ্ট কবি ও সাহিত্যিক।
+OCR:       একজন বিশিষ্ট কবি ও সাহিত্যিক।
+
+Both lines appear to have errors, even though the OCR actually captured all the words correctly.
+
+An even more common case: line splitting
+
+Reference:
+
+রবীন্দ্রনাথ ঠাকুর বাংলা সাহিত্যের একজন
+বিশিষ্ট কবি।
+
+OCR:
+
+রবীন্দ্রনাথ ঠাকুর বাংলা সাহিত্যের
+একজন বিশিষ্ট কবি।
+
+Now the boundaries don't correspond.
+
+Or OCR might do the opposite:
+
+Reference:
+রবীন্দ্রনাথ ঠাকুর বাংলা সাহিত্যের
+একজন বিশিষ্ট কবি।
+
+OCR:
+রবীন্দ্রনাথ ঠাকুর বাংলা সাহিত্যের একজন বিশিষ্ট কবি।
+
+Here two reference lines became one OCR line.
+
+So what does alignment solve?
+
+Instead of assuming:
+
+reference[1] ↔ OCR[1]
+reference[2] ↔ OCR[2]
+reference[3] ↔ OCR[3]
+
+we first ask:
+
+"Which reference lines correspond to which OCR lines?"
+
+That's what our alignment step determines.
+
+Conceptually:
+
+Reference lines             OCR lines
+
+R1 ───────────────────────→ O1
+R2 ───────────────────────→ O2
+R3 ────────────────┐
+                   └──────→ O3
+R4 ───────────────────────→ O4
+
+The alignment can account for:
+
+Substitution → OCR changed something
+Insertion → OCR has extra content
+Deletion → OCR missed content
+Line boundary differences → lines were split/merged
+
+Then we calculate CER against the aligned text, rather than incorrectly comparing lines purely by their position.
+
+Why Needleman–Wunsch?
+
+We could have used simpler alternatives.
+
+Alternative 1 — positional comparison
+R1 ↔ O1
+R2 ↔ O2
+R3 ↔ O3
+
+Rejected: very fragile when OCR changes line boundaries.
+
+Alternative 2 — independently find the closest OCR line
+
+For every reference line, find the OCR line with the smallest edit distance.
+
+Problem: two reference lines might both choose the same OCR line, and we lose the overall sequence structure.
+
+Our approach — sequence alignment
+
+Needleman–Wunsch considers the whole sequence and finds a globally consistent alignment using dynamic programming.
+
+So the important idea is:
+
+We aren't using Needleman–Wunsch because OCR text itself necessarily needs fuzzy matching. We're using it because the line boundaries between the reference and OCR output are not guaranteed to correspond.
+
+That's the key reason for having the alignment stage in our pipeline.
+
+And there's an important limitation we should discuss next: Needleman–Wunsch can also produce a wrong alignment, so alignment itself needs to be validated before we trust the resulting CER.
+
+User: Why are we doing fuzzy line alignment instead of exact string matching? What kind of OCR mistakes make exact matching fail?
+
+Assistant:
+Because exact string matching is too strict for OCR output. In our pipeline, the OCR text can be essentially correct while still being different from the reference at the character level or at the line-boundary level.
+
+Simple example
+
+Suppose the reference contains:
+
+রবীন্দ্রনাথ ঠাকুর বাংলা সাহিত্যের একজন কবি
+
+OCR might produce:
+
+রবীন্দ্রনাথ ঠাকুর বাংলা সাহিত্যের একজন কবি।
+
+The only difference is the punctuation.
+
+An exact comparison says:
+
+Reference == OCR
+        ↓
+      FALSE
+
+But for our purpose, these are clearly the same line.
+
+What kinds of OCR errors cause this?
+1. Character substitutions
+
+Reference:
+
+রবীন্দ্রনাথ
+
+OCR:
+
+রবীন্দ্রনাথ
+
+If one Bengali character/glyph is misrecognized, exact matching immediately fails.
+
+For example conceptually:
+
+Reference: বাংলা
+OCR:       বাংগা
+
+Even though a human can recognize that these are extremely similar, exact matching says different strings.
+
+2. Missing characters
+
+Reference:
+
+সাহিত্যের
+
+OCR:
+
+সাহিত্য
+
+One or more characters disappeared.
+
+Again:
+
+exact match → FAIL
+
+But this is still probably the correct corresponding line.
+
+3. Extra characters
+
+OCR might introduce noise:
+
+Reference:
+রবীন্দ্রনাথ ঠাকুর
+
+OCR:
+রবীন্দ্রনাথ ঠাকুর |
+
+The extra character means exact matching fails.
+
+4. Bengali Unicode/normalization differences
+
+This is particularly important for Bengali.
+
+Two visually identical pieces of text can sometimes have different Unicode representations because of combining characters.
+
+That's why our evaluation pipeline performs normalization before comparison.
+
+But normalization doesn't solve actual OCR mistakes. If Tesseract genuinely recognizes one glyph incorrectly, the strings remain different.
+
+5. Line-boundary differences
+
+This is arguably the more important reason we need alignment.
+
+Reference:
+
+R1: রবীন্দ্রনাথ ঠাকুর বাংলা সাহিত্যের
+R2: একজন বিখ্যাত কবি।
+
+OCR:
+
+O1: রবীন্দ্রনাথ ঠাকুর বাংলা সাহিত্যের একজন
+O2: বিখ্যাত কবি।
+
+There isn't an obvious:
+
+R1 == O1
+R2 == O2
+
+relationship.
+
+Even though almost all the actual text is there, the line boundaries have shifted.
+
+So exact positional matching would incorrectly conclude that both lines contain substantial errors.
+
+Why "fuzzy alignment" helps
+
+We're essentially saying:
+
+"Don't require the lines to be identical. Find the most plausible correspondence between the two sequences."
+
+So instead of:
+
+R1 == O1 ?
+R2 == O2 ?
+R3 == O3 ?
+
+we do:
+
+R1 ──┐
+     ├── Which OCR line is most likely its counterpart?
+R2 ──┤
+     │
+R3 ──┘
+
+Needleman–Wunsch considers the sequence as a whole, allowing matches, insertions, deletions, and substitutions.
+
+Then we can calculate CER on the aligned material.
+
+Why not just use exact matching after normalization?
+
+That's actually a reasonable alternative.
+
+We could do:
+
+Reference
+   ↓
+Unicode normalization
+   ↓
+exact comparison
+   ↓
+match / no match
+
+But we'd still have problems with:
+
+OCR character errors
+missing characters
+extra characters
+line splitting
+line merging
+
+So we reject exact matching as the primary alignment mechanism because it is too brittle for noisy OCR.
+
+The trade-off is that fuzzy alignment is more computationally expensive and can itself make a wrong alignment if two lines are very similar.
+
+That's an important limitation of our approach.
+
+The key point for your defense
+
+You can say:
+
+"We use fuzzy line alignment because OCR output is noisy and its line boundaries are not guaranteed to match the reference. Exact string matching would treat small OCR errors or shifted line boundaries as complete mismatches. Needleman–Wunsch gives us a globally consistent correspondence between reference and OCR lines before we calculate the evaluation metrics."
+
+And then, if sir pushes:
+
+"But fuzzy alignment can also introduce incorrect correspondences, so we need to consider the alignment score and other quality checks rather than assuming every alignment is correct."
+
+That last sentence is particularly important because we should not present Needleman–Wunsch as infallible.
+
+
 User: Uploaded layout.py again after some modifications
 
 Assistant:
@@ -876,6 +1180,163 @@ Your Stage 2 now satisfies the important requirements:
 ✅ Suitable for your explainability requirement
 
 The next thing I'd do is test this against a small set of actual Volume 25 pages containing prose + centered poetry + indentation + [ প্রস্থান, rather than changing the algorithm further. If those cases produce the expected region_id sequence, Stage 2 can be considered stable.
+
+
+User: Why did we choose global alignment rather than just finding the closest matching line independently?
+
+Assistant:
+Because in our OCR pipeline, we don't just want to know which OCR line is most similar to each reference line. We want to preserve the order and one-to-one sequence relationship between the reference and OCR.
+
+Imagine this
+
+Reference:
+
+R1 = রবীন্দ্রনাথের কবিতা
+R2 = বাংলা সাহিত্যের গুরুত্বপূর্ণ অংশ
+R3 = তাঁর রচনাগুলো আজও জনপ্রিয়
+
+OCR:
+
+O1 = রবীন্দ্রনাথের কবিতা
+O2 = তাঁর রচনাগুলো আজও জনপ্রিয়
+O3 = বাংলা সাহিত্যের গুরুত্বপূর্ণ অংশ
+
+If we independently find the closest line, we might get:
+
+R1 → O1
+R2 → O3
+R3 → O2
+
+The individual matches might all look excellent.
+
+But we've lost the fact that the OCR sequence is in a different order.
+
+A more problematic example
+
+Suppose:
+
+R1 = বাংলা সাহিত্যের ইতিহাস
+R2 = বাংলা সাহিত্যের গুরুত্বপূর্ণ কবি
+R3 = রবীন্দ্রনাথ ঠাকুর
+
+OCR:
+
+O1 = বাংলা সাহিত্যের ইতিহাস
+O2 = রবীন্দ্রনাথ ঠাকুর
+O3 = বাংলা সাহিত্যের গুরুত্বপূর্ণ কবি
+
+Independent matching happily gives:
+
+R1 → O1
+R2 → O3
+R3 → O2
+
+But for our evaluation, sequence order matters.
+
+The reference is:
+
+R1 → R2 → R3
+
+and the OCR is:
+
+O1 → O2 → O3
+
+Global alignment makes us account for the entire sequence rather than treating every line independently.
+
+Why this matters even more with OCR errors
+
+Consider:
+
+Reference:
+
+R1 = রবীন্দ্রনাথ ঠাকুর
+R2 = বাংলা সাহিত্যের কবি
+R3 = তাঁর কবিতাগুলো বিখ্যাত
+
+OCR:
+
+O1 = রবীন্দ্রনাথ ঠাকুর
+O2 = তাঁর কবিতাগুলো বিখ্যাত
+O3 = বাংলা সাহিত্যের কবি
+
+Independent nearest matching can find good pairs, but it doesn't tell us:
+
+"Is this actually a plausible sequential OCR output?"
+
+Global alignment considers the whole path through the sequence.
+
+What global alignment gives us
+
+Think of it like this:
+
+Reference: R1 → R2 → R3 → R4
+              ↘
+OCR:       O1 → O2 → O3 → O4
+
+Needleman–Wunsch finds a path through the DP matrix that represents the best overall alignment.
+
+It can say:
+
+R1 ↔ O1
+R2 ↔ O2
+R3 ↔ gap
+R4 ↔ O3
+
+rather than forcing every reference line to independently find its favorite OCR line.
+
+So it preserves:
+
+order
+insertions
+deletions
+substitutions
+overall sequence consistency
+Alternative we could have used
+Independent closest-line matching
+
+For each reference line:
+
+find OCR line with minimum edit distance
+
+It's simpler and potentially faster.
+
+But we reject it for our pipeline because:
+
+Two reference lines can choose the same OCR line.
+It doesn't naturally represent missing/extra lines.
+It ignores sequence order.
+It can produce locally good matches but a globally nonsensical alignment.
+
+For example:
+
+R1 → O2
+R2 → O2
+R3 → O4
+
+That's obviously problematic, but independent matching doesn't inherently prevent it.
+
+The trade-off
+
+Global alignment isn't automatically "better" in every situation.
+
+Advantage:
+
+More structurally consistent alignment of the reference and OCR sequences.
+
+Cost:
+
+More computation and more complexity than simply finding the nearest line.
+
+And there is another important limitation:
+
+Global alignment can still choose the wrong correspondence if two lines are very similar or the OCR output is badly corrupted.
+
+So we're choosing global alignment because our problem is fundamentally a sequence-alignment problem, not just a collection of independent string-matching problems.
+
+The defense answer I'd give
+
+"We chose global alignment because reference lines and OCR lines form ordered sequences. Independent closest-line matching only considers local similarity and can produce duplicate, reordered, or inconsistent matches. Needleman–Wunsch considers the entire sequence and allows insertions and deletions while preserving the overall order. This gives us a more reliable correspondence before calculating CER, although it has the trade-off of higher complexity and the possibility of incorrect alignment when the OCR is severely corrupted."
+
 
 User: I am working on filling the stubs in `src/doc_agent/vision/ocr.py` for my Stage 3 implementation. Since my Stage 2 layout detector already supplies line-level bounding boxes (`Region` objects), I need to implement `transcribe_region` in the `Reader` class.
 
@@ -3316,6 +3777,490 @@ index/cite
 
 That is exactly the architecture we want for your **line-level Explainability NFR**.
 
+User: Which parts of the OCR pipeline should be tested independently?
+
+Assistant:
+The idea is to test the pipeline stage-by-stage, rather than only testing the final OCR output. That makes it much easier to identify where a failure happened.
+
+For our OCR pipeline, I'd separate the tests roughly like this:
+
+1. Ingestion / loading
+
+Test whether the input document is loaded correctly.
+
+For example:
+
+PDF/image exists and can be opened.
+Correct number of pages is detected.
+Page IDs are preserved.
+Corrupt or unsupported input is handled properly.
+
+Why independently?
+If loading fails, there's no point blaming preprocessing or Tesseract.
+
+2. Preprocessing
+
+Test things like:
+
+deskewing
+binarization
+blank-page detection
+image dimensions/format
+whether preprocessing accidentally removes Bengali characters
+
+For example:
+
+Given a synthetic page containing text, preprocessing should not classify it as blank.
+
+This is especially important because preprocessing errors can silently propagate into OCR.
+
+3. Layout / reading order
+
+Test whether the system correctly identifies the structure of the page.
+
+For a two-column page, for example:
+
+Column 1          Column 2
+
+line A            line D
+line B            line E
+line C            line F
+
+The expected reading order might be:
+
+A → B → C → D → E → F
+
+rather than:
+
+A → D → B → E → C → F
+
+Why independently?
+
+Because if the OCR text looks wrong, we need to know whether:
+
+OCR misread the characters
+
+or
+
+Layout detection gave OCR the regions in the wrong order.
+
+4. OCR itself
+
+Here we test the actual OCR stage.
+
+Things like:
+
+Bengali characters are recognized.
+Text is returned for non-blank pages.
+Empty pages don't produce meaningless OCR.
+Expected output structure is preserved.
+OCR failures are handled gracefully.
+
+Importantly, we shouldn't make the OCR tests depend entirely on a huge real corpus. That's where controlled/synthetic inputs are useful.
+
+5. Text normalization
+
+If our pipeline normalizes Unicode/text before evaluation, test that separately.
+
+For example:
+
+raw OCR
+   ↓
+normalization
+   ↓
+normalized OCR
+
+The test should verify that normalization:
+
+handles Bengali Unicode correctly,
+doesn't unnecessarily change valid text,
+produces consistent representations for equivalent text.
+6. Line alignment
+
+This should definitely have its own tests.
+
+We can give the alignment function controlled examples:
+
+Reference:
+A
+B
+C
+
+OCR:
+A
+X
+C
+
+and verify that the alignment recognizes the appropriate substitution.
+
+Also test:
+
+Reference:
+A
+B
+C
+
+OCR:
+A
+C
+
+to test a missing OCR line.
+
+And cases where line counts differ.
+
+This allows us to test Needleman–Wunsch independently of Tesseract.
+
+That's important because otherwise a failing alignment test could actually be caused by OCR output.
+
+7. CER / ECR evaluation
+
+The metrics themselves should be independently tested.
+
+For example, if:
+
+Reference = "abc"
+OCR       = "abc"
+
+CER should be:
+
+0
+
+If one character is wrong:
+
+Reference = "abc"
+OCR       = "axc"
+
+we should know exactly what CER we expect.
+
+Similarly, test the conditions used for your ECR calculation.
+
+The important principle is:
+
+We should know that our metric implementation is correct independently of whether Tesseract performs well.
+
+8. Metadata / JSONL sidecars
+
+Test that metadata remains correctly associated with the OCR output.
+
+For example:
+
+page_id
+line_id
+document_id
+OCR text
+confidence/evaluation metadata
+
+shouldn't accidentally become mismatched.
+
+This is particularly important because later stages depend on provenance.
+
+9. Chunking
+
+Test that:
+
+poems are split according to the intended stanza structure,
+prose follows the intended paragraph structure,
+metadata is preserved,
+chunks don't accidentally cross document boundaries.
+
+Again, this shouldn't require running the entire RAG pipeline.
+
+10. Integration test
+
+Finally, we should have some tests that intentionally run multiple stages together:
+
+input
+ ↓
+preprocess
+ ↓
+layout
+ ↓
+OCR
+ ↓
+alignment/evaluation
+ ↓
+chunk
+
+These answer a different question:
+
+"Do the components work correctly together?"
+
+The important distinction
+
+We therefore have two types of testing:
+
+Unit-level:
+
+Preprocess → test it alone
+Layout     → test it alone
+OCR        → test it alone
+Alignment  → test it alone
+CER/ECR    → test it alone
+Chunking   → test it alone
+
+Integration-level:
+
+PDF → preprocessing → layout → OCR → evaluation → chunks
+
+The reason we want both is failure localization.
+
+If an end-to-end test fails, we only know:
+
+"Something is broken."
+
+If the individual tests also exist, we can determine:
+
+"Preprocessing passed, layout passed, OCR passed, but alignment failed."
+
+That's much more useful for debugging and for defending the architecture.
+
+One thing I'd be careful about in our project: I wouldn't claim that every one of these stages is currently independently tested unless the actual test files show that. Some are architectural testing targets, while others may be covered by the tests you currently have.
+
+
+User: What kinds of edge cases should our OCR tests cover?
+
+Assistant:
+For our OCR pipeline, the edge cases should test not only "does OCR recognize normal text?", but also "does the pipeline behave safely when the input is unusual or partially broken?"
+
+I'd group them like this:
+
+1. Blank or almost-blank pages
+
+Test:
+
+completely blank page
+page with only a tiny mark
+page with page number but no actual text
+mostly white scanned page
+
+Why?
+
+Our preprocessing has a blank-page filter. We need to make sure it doesn't accidentally discard a page containing very small but valid Bengali text.
+
+2. Very noisy scans
+
+Test pages with:
+
+speckles/noise
+uneven background
+faint text
+dark background regions
+scanning artifacts
+
+The important question is:
+
+Does preprocessing improve the page, or accidentally remove actual characters?
+
+3. Skewed pages
+
+For example:
+
+Normal:
+──────────────
+
+Skewed:
+   ───────────
+
+Test small and larger rotations.
+
+This is important because our preprocessing includes deskewing.
+
+We should verify that:
+
+a slightly skewed page is corrected,
+severe skew doesn't crash the pipeline,
+text isn't damaged by unnecessary rotation.
+4. Bengali-specific characters
+
+This is particularly important for our project.
+
+Test:
+
+যুক্তাক্ষর
+কার/মাত্রা
+ং / ঁ / ঃ
+punctuation
+Bengali numerals
+unusual Bengali character combinations
+
+For example, a test should ensure that preprocessing/normalization doesn't accidentally separate or destroy visually connected Bengali characters.
+
+5. Empty OCR output
+
+What happens if Tesseract returns:
+
+""
+
+for a page?
+
+The pipeline shouldn't crash.
+
+It should propagate an appropriate empty/failed result so later stages don't assume text exists.
+
+6. Very short text
+
+For example:
+
+"ক"
+
+or:
+
+"হ্যাঁ।"
+
+This is useful because metrics such as CER can behave differently on extremely short strings.
+
+7. Very long text
+
+Test a page containing a large amount of text.
+
+We want to make sure:
+
+OCR doesn't truncate unexpectedly,
+line extraction remains correct,
+metadata remains consistent.
+8. Multiple columns / complicated layout
+
+For example:
+
+Column A       Column B
+
+A1             B1
+A2             B2
+A3             B3
+
+The expected reading order should be preserved.
+
+This tests the layout stage, not just Tesseract.
+
+9. Line boundary problems
+
+This is especially important because we use line alignment.
+
+Test:
+
+Reference:
+A
+B
+C
+
+OCR:
+A B
+C
+
+and:
+
+Reference:
+A
+B
+C
+
+OCR:
+A
+B
+C
+D
+
+We want to verify that alignment/evaluation doesn't assume equal numbers of lines.
+
+10. OCR character errors
+
+Create controlled examples where:
+
+Reference: বাংলা
+OCR:       বাংগা
+
+or one character is:
+
+missing
+substituted
+added
+
+Then verify that the evaluation metrics behave as expected.
+
+This tests CER independently of Tesseract's actual performance.
+
+11. Unicode normalization
+
+Test text that is visually equivalent but has different Unicode representations.
+
+We want to make sure normalization doesn't:
+
+incorrectly mark equivalent text as different,
+alter valid Bengali text,
+break combining characters.
+12. Metadata consistency
+
+This one is easy to overlook.
+
+Suppose we have:
+
+document_id = D1
+page_id     = P57
+line_id     = L3
+
+After OCR → alignment → chunking, those identifiers should still refer to the correct content.
+
+A test should catch situations where:
+
+OCR text from P57 accidentally gets metadata belonging to P58.
+
+That's particularly important for our later citation and cross-document isolation.
+
+13. Malformed input
+
+Test things like:
+
+missing image
+corrupted image
+unsupported image format
+zero-byte file
+invalid page metadata
+
+The expected behavior shouldn't be a mysterious exception somewhere downstream.
+
+14. Duplicate / repeated lines
+
+Literary texts can contain repeated lines, headings, or refrains.
+
+For example:
+
+R1 = "আবার আসিব ফিরে"
+R2 = "আবার আসিব ফিরে"
+
+This is useful for testing alignment because two lines may be equally similar.
+
+It helps us see whether Needleman–Wunsch can produce ambiguous alignments.
+
+The most important edge cases for our project
+
+If you want to keep the testing discussion manageable for your sir, I'd prioritize these:
+
+Blank / near-blank page
+Noisy scan
+Skewed page
+Bengali Unicode / যুক্তাক্ষর
+Empty OCR output
+OCR character insertion/deletion/substitution
+Different reference/OCR line counts
+Multi-column reading order
+Repeated/similar lines
+Metadata/document ID preservation
+
+And there's a nice architectural reason for this selection:
+
+Each edge case corresponds to a different possible failure point in our pipeline.
+
+For example:
+
+Skewed page          → preprocessing
+Two columns          → layout
+Wrong Bengali glyph  → OCR
+Different line count → alignment
+Wrong CER            → evaluation
+Wrong document_id    → metadata/provenance
+Wrong retrieved text → downstream RAG
+
+So our tests aren't just checking random weird inputs. They're designed to localize failures to specific stages of the architecture.
 
 User: Uploaded kb_demo.ipynb
 Please check if the current implementation looks good. You can verify it against the cell outputs.
@@ -4065,12 +5010,484 @@ For your Decoding the Archives project, I'd present CER as the primary OCR metri
 So yes: the modification was beneficial. I would stop tweaking for now and add more representative gold pages.
 
 
+User: Why is cross-document isolation important for citations and not just retrieval?
+
+Assistant:
+Because in our system, a citation is not just saying “this answer came from somewhere.” It is supposed to tell the user exactly where the evidence came from.
+
+Suppose our corpus contains:
+
+Document A → রবীন্দ্র রচনাবলী, Volume 25
+Document B → another book
+
+A user asks:
+
+“What did Tagore say about X?”
+
+The retriever accidentally returns a similar passage from Document B, while the system labels the citation as coming from Document A.
+
+Then we have a much more serious problem than just bad retrieval:
+
+Wrong retrieval
+      ↓
+Wrong document metadata
+      ↓
+Wrong citation
+      ↓
+User believes the answer is supported by Document A
+
+So citation integrity depends on document identity being preserved throughout the pipeline.
+
+Why retrieval isolation alone isn't enough
+
+Imagine retrieval correctly finds this chunk:
+
+chunk_id: C57
+document_id: volume_25
+page_id: P103
+text: ...
+
+But somewhere during chunking or metadata handling, document_id gets lost or replaced:
+
+chunk_id: C57
+document_id: volume_24   ← WRONG
+page_id: P103
+
+The text retrieved is correct, but the citation is now wrong.
+
+So we have two separate requirements:
+
+Retrieval correctness:
+
+Did we retrieve the right passage?
+
+Citation correctness:
+
+Can we prove that this passage actually came from the document/page we claim it came from?
+
+This is why provenance matters
+
+Our intended chain is essentially:
+
+Original document
+      ↓
+Page
+      ↓
+OCR lines
+      ↓
+Aligned/evaluated text
+      ↓
+Chunk
+      ↓
+Embedding
+      ↓
+Retrieved chunk
+      ↓
+Citation
+
+The identity needs to survive every stage:
+
+document_id
+    +
+page_id
+    +
+line/chunk information
+
+Then when the RAG system retrieves a chunk, we can trace it back to its actual source.
+
+Another important case
+
+Suppose two documents contain almost identical text:
+
+Document A:
+"রবীন্দ্রনাথ ..."
+
+Document B:
+"রবীন্দ্রনাথ ..."
+
+Semantic retrieval may consider both highly similar.
+
+If we don't enforce document identity, the system could retrieve from B while the user specifically asked:
+
+“According to Volume 25...”
+
+The answer might even be factually correct, but it would not satisfy the source constraint.
+
+That's why cross-document isolation is not merely a retrieval concern.
+
+The key distinction
+
+You can explain it to your sir like this:
+
+“Cross-document isolation ensures that retrieval respects the requested source, while provenance preservation ensures that the citation actually points back to the source from which the retrieved text came. Without document identity throughout the pipeline, we can have either a wrong source being retrieved or a correct passage being cited as if it came from the wrong document.”
+
+And this is also why document_id shouldn't disappear after the retrieval stage. It needs to travel with the content from ingestion all the way to the final citation.
+
+
+User: Why Tesseract? Why not directly use a modern transformer-based Bengali OCR model?
+
+Assistant:
+I’d defend Tesseract as the baseline, not as the claim that it is the best Bengali OCR model.
+
+Why did we choose Tesseract?
+
+The main reason is that our project needs a reproducible, lightweight baseline before we evaluate the rest of the pipeline.
+
+Our reasoning is roughly:
+
+Scanned Bengali literature
+        ↓
+Preprocessing
+        ↓
+Tesseract OCR
+        ↓
+Line alignment
+        ↓
+CER / ECR evaluation
+        ↓
+Chunking
+        ↓
+Embedding + RAG
+
+Tesseract gives us a relatively simple and controllable OCR component, so we can study what happens downstream when OCR has realistic errors.
+
+But wouldn't a modern Transformer OCR model be better?
+
+Potentially, yes.
+
+A Bengali transformer-based OCR model could give substantially better recognition on some difficult scans. But replacing Tesseract immediately would introduce another variable:
+
+Is an improvement in our RAG system coming from our architecture, or simply because we switched to a much stronger OCR model?
+
+With Tesseract as the baseline, we have a clear reference point.
+
+For example:
+
+Tesseract OCR
+      ↓
+CER = X
+      ↓
+RAG retrieval = Y
+
+Improved OCR
+      ↓
+CER = better
+      ↓
+RAG retrieval = better?
+
+That lets us study the relationship between OCR quality and downstream RAG performance.
+
+Another reason: computational cost
+
+A transformer OCR model can require:
+
+larger model weights,
+more RAM/VRAM,
+additional ML dependencies,
+model downloading,
+potentially GPU acceleration.
+
+Our pipeline should remain practical on a relatively modest laptop.
+
+Tesseract is much easier to run as a baseline without making the entire project dependent on a heavy ML stack.
+
+But there is an important trade-off
+
+We should not claim:
+
+"Tesseract is the best choice for Bengali OCR."
+
+That's not defensible.
+
+A better statement is:
+
+"We use Tesseract as a lightweight, reproducible baseline and evaluate its limitations on Bengali literary scans. A modern Bengali transformer OCR model is a potential improvement/alternative that can be evaluated later."
+
+That is much stronger academically.
+
+Why not use both?
+
+Actually, that could be a very good extension if the project scope allows it.
+
+We could compare:
+
+                    Same scanned pages
+                           │
+              ┌────────────┴────────────┐
+              ↓                         ↓
+        Tesseract OCR          Transformer OCR
+              ↓                         ↓
+            CER                       CER
+              ↓                         ↓
+         Retrieval                  Retrieval
+              ↓                         ↓
+        RAG quality                RAG quality
+
+Then we could answer a much more interesting research question:
+
+Does better OCR accuracy actually translate into better Bengali RAG retrieval and answer quality?
+
+Because lower CER does not automatically guarantee better retrieval.
+
+So the "rejected alternative" argument
+
+You can say:
+
+"We considered using a modern transformer-based Bengali OCR model directly. We did not make it the initial OCR engine because it would introduce greater computational and dependency requirements and make it harder to establish a lightweight baseline. We therefore chose Tesseract first, with the transformer-based model remaining a possible comparative extension."
+
+And if sir asks:
+
+"So you're saying Tesseract is better?"
+
+Answer:
+
+"No. We're saying Tesseract is a suitable baseline for our experimental pipeline. A transformer OCR model may perform better, and comparing the two would actually be a useful extension."
+
+That distinction is important.
+
+
+User: Why use CER as the primary metric instead of WER??
+
+Assistant:
+Because CER (Character Error Rate) is a better fit for our Bengali OCR task than WER (Word Error Rate).
+
+First, what are they measuring?
+
+Both are based on edit distance.
+
+CER:
+
+CER=
+N
+S+D+I
+	​
+
+
+where:
+
+S = character substitutions
+D = character deletions
+I = character insertions
+N = number of characters in the reference
+
+So if the reference is:
+
+বাংলা
+
+and OCR produces:
+
+বাংগা
+
+CER can detect that there is a character-level difference.
+
+WER does the same basic idea, but treats an entire word as the unit.
+
+Why CER fits our project better
+1. OCR errors often happen inside words
+
+Bengali OCR can make mistakes involving:
+
+যুক্তাক্ষর
+কার/মাত্রা
+combining characters
+individual glyphs
+punctuation
+character substitutions/deletions
+
+Suppose:
+
+Reference:
+সাহিত্যের
+
+OCR:
+সাহিত্য
+
+WER sees this roughly as:
+
+Reference word: সাহিত্যের
+OCR word:       সাহিত্য
+
+→ one wrong word
+
+It doesn't tell us much about how much of that word was actually wrong.
+
+CER gives us a finer-grained measurement.
+
+2. Bengali word boundaries aren't always the most useful unit
+
+Our pipeline ultimately works with OCR text and line-level alignment.
+
+We're already comparing:
+
+reference line
+      ↕
+OCR line
+
+So character-level distance naturally fits that evaluation.
+
+The pipeline is essentially:
+
+Reference lines
+      ↕
+Needleman–Wunsch alignment
+      ↕
+Aligned OCR lines
+      ↓
+Character-level comparison
+      ↓
+CER
+
+CER therefore fits naturally after the alignment stage.
+
+3. WER can exaggerate small OCR errors
+
+Imagine:
+
+Reference:
+রবীন্দ্রনাথ
+
+OCR:
+রবীন্দ্রনাথ্
+
+Suppose only one character/mark is incorrect.
+
+At the word level, WER may effectively treat the entire word as incorrect.
+
+CER gives us a more granular measurement of the actual textual difference.
+
+So:
+
+One small character error shouldn't necessarily be treated as an entirely incorrect word.
+
+But why not use WER at all?
+
+We shouldn't say WER is useless.
+
+It's actually useful as a secondary metric.
+
+For example:
+
+Metric	What it tells us
+CER	How many character-level errors OCR makes
+WER	How many word-level errors OCR makes
+
+CER is our primary metric because we're evaluating the quality of the OCR text at a fine-grained level.
+
+WER could still provide an additional perspective.
+
+There's also a practical reason
+
+Our alignment is happening at the line level, and then we need to quantify how similar the aligned reference and OCR text are.
+
+CER gives us a relatively continuous signal:
+
+0% CER   → almost identical
+5% CER   → small amount of corruption
+20% CER  → substantial corruption
+50% CER  → very poor OCR
+
+That is useful when comparing preprocessing/OCR configurations.
+
+With WER, a single character mistake can turn an otherwise correct word into a completely incorrect word.
+
+Alternative we considered
+
+We could have used WER as the primary metric.
+
+Why we reject that as primary:
+It is less granular.
+Small character errors can make an entire word count as wrong.
+Bengali OCR errors can occur within words.
+Our line-level evaluation naturally fits character-level edit distance.
+Chosen:
+
+CER as primary + WER as a possible secondary metric.
+
+One important caveat
+
+CER isn't perfect either.
+
+For Bengali, Unicode normalization and how we define a "character" matter a lot. If visually equivalent Bengali representations are encoded differently, we could artificially inflate CER.
+
+So our evaluation needs consistent Unicode normalization before calculating the metric.
+
+And there's another important limitation:
+
+A low CER doesn't necessarily mean the OCR is perfect for RAG.
+
+For example, if one important literary name is corrupted while everything else is correct, overall CER could still be low, but that particular error might seriously affect retrieval.
+
+So the stronger evaluation story is:
+
+CER
+ ↓
+overall OCR quality
+
++
+line alignment
+ ↓
+where errors occur
+
++
+retrieval metrics
+ ↓
+whether OCR quality actually affects RAG
+
++
+citation/provenance
+ ↓
+whether retrieved evidence is trustworthy
+
+That's why CER is the right primary OCR metric for our pipeline, but it shouldn't be treated as the only measure of system quality.
+
+
+
 ========================================================================
 REFLECTION
 ========================================================================
 
+
+
 - What worked well:
+
+1.Using AI to discuss the pipeline stage-by-stage helped me understand why each component exists, instead of only focusing on whether the code works.
+
+2.The discussion of Needleman–Wunsch alignment helped clarify why simple line-by-line comparison is unreliable when OCR inserts, deletes, splits, or merges lines.
+
+3.Discussing CER vs WER helped me understand why CER is more suitable as the primary metric for Bengali OCR.
+
+4.AI helped identify important edge cases and failure modes, such as blank pages, noisy scans, skewed pages, different numbers of reference/OCR lines, and repeated lines.
+
+5.The discussion of OCR → retrieval → RAG failure propagation helped connect the OCR work to the final RAG system rather than treating OCR as an isolated component.
+
+6.Discussing alternatives such as whole-page OCR, transformer OCR, exact line matching, and different alignment strategies helped me understand the trade-offs behind the chosen architecture.
+
+
 
 - What didn't work / had to be fixed manually:
 
+1.Some explanations initially oversimplified the actual pipeline flow, particularly the distinction between spatial reading-order processing in layout.py and reference/OCR line alignment in ocr.py.
+
+2.Some architectural explanations were based on the conceptual pipeline rather than the exact implementation, so I had to verify them against the actual files.
+
+3.There was a Tesseract PSM configuration mismatch. The discussion/checklist stated that Stage 2 used --oem 1 --psm 3, while the actual layout.py configuration was using PSM 4. After observing that PSM 4 was performing better on our scanned pages, I updated the configuration to use PSM 4 rather than following the earlier PSM 3 recommendation.
+
+4.Also there was a major issue with the recommendation to use exact line-count matching. The assistant suggested requiring the reference and OCR output to have exactly the same number of lines. However, in practice, the line count often differs because OCR may split or merge lines, and enforcing exact equality meant that for many pages we could not obtain meaningful line-level CER/WER measurements at all. I therefore kept the fuzzy Needleman–Wunsch alignment with a small allowed line-count difference (max_line_diff=2), which allows reasonable OCR segmentation differences while still maintaining sequence alignment.
+
+5.AI suggestions sometimes assumed that a component belonged to a separate stage/module when it was actually handled inside an existing file.
+
+6.Some proposed approaches were too general and had to be adjusted to match the project's actual constraints, such as the existing contracts and metadata structure.
+
+7.AI could suggest possible solutions, but the final decisions still required checking the implementation, tests, and project requirements manually.
+
+
+
 - Anything I disagreed with or changed after using it:
+
+I intentionally held off on jumping straight to a heavy transformer-based Bengali OCR model. Keeping Tesseract as our baseline gave us a lightweight, fully reproducible control, while leaving neural models like TrOCR open as a clear next step if we hit an accuracy ceiling.
+
+Early on, I realized page-wide OCR wouldn't cut it—without layout awareness, you lose the reading order and line structure that our citation model depends on. That sequence structure also dictated our alignment choice: simple closest-line matching fails when lines get dropped or added, whereas a global Needleman–Wunsch DP alignment respects the actual sequential flow of the text.
+
+When evaluating outputs, I prioritized CER over WER as the core metric, though tracking WER remains useful for readability. Instead of throwing out low-confidence or rejected OCR text, I routed that metadata into sidecars for auditing—silent failure is much worse than flagged dirty data.
+
+Keeping document and page provenance strictly attached at every step wasn't just about retrieval filtering; it was essential for citation integrity. Ultimately, my perspective shifted: this isn't just an OCR pipeline—it’s an end-to-end information-preservation pipeline where an error in layout or text cascades straight into chunking, vector search, and final LLM grounding.
