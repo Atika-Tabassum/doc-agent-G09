@@ -236,17 +236,53 @@ def test_transcribe_gold_requires_exact_match_not_just_page_membership(synthetic
     assert not rows[2]["accepted"]  # no IA reference available either -> falls through to rejection
 
 
-def test_transcribe_reference_alignment_requires_exact_line_count(synthetic_corpus):
-    """A reference file whose line count doesn't exactly match the detected region count must refuse
-    alignment entirely (reference_alignment_failed for every line on that page), even when the two
-    counts are close -- positional correspondence isn't trustworthy on anything less than an exact
-    match, since a single-line offset silently misaligns every line after it."""
+def test_transcribe_reference_alignment_tolerates_small_line_count_mismatch(synthetic_corpus, tmp_path):
+    """A reference file with a SMALL (<= cfg['ocr']['max_line_diff'], default 2) line-count mismatch
+    against the detected region count must still align via _align_lines' content-aware DP (a
+    Levenshtein-ratio-scored correspondence, not a naive index shift) -- the genuinely-matching lines
+    are accepted, and the one extra/unmatched reference line is simply absent from the alignment
+    (falls through like "no reference for this line" would), rather than voiding the whole page.
+    Uses this environment's real Tesseract output as the reference lines (see _actual_ocr_lines) so
+    the 3 real lines are near-exact matches and the DP has an unambiguous best alignment to find."""
+    actual_lines = _actual_ocr_lines(synthetic_corpus, "testwork_p0001")
+    assert len(actual_lines) == 3
+
     from pathlib import Path
     raw_dir = Path(synthetic_corpus["paths"]["raw_dir"]) / "testwork"
-    # page 1 has 3 detected lines; give it 4 reference lines (a "close" mismatch)
+    # page 1 has 3 detected lines; give it 4 reference lines (a 1-line, "close" mismatch) -- the
+    # first 3 are this environment's real OCR output (near-exact matches), the 4th has no
+    # counterpart among the detected regions at all.
     (raw_dir / "testwork_p0001.ref.txt").write_text(
-        "The quick brown fox jumps.\nOver the lazy dog again.\nThird line of test text.\nEXTRA LINE\n",
-        encoding="utf-8",
+        "\n".join(actual_lines) + "\nEXTRA LINE WITH NO MATCHING REGION\n", encoding="utf-8",
+    )
+    pages = preprocess.run(loader.load_pages(synthetic_corpus), synthetic_corpus)
+    regions = layout.detect(pages, synthetic_corpus)
+    chunks = ocr.transcribe(regions, synthetic_corpus)
+
+    rows = sorted(
+        [r for r in (json.loads(l) for l in
+         open(Path(synthetic_corpus["paths"]["processed_dir"]) / "ocr_meta.jsonl", encoding="utf-8"))
+         if r["page_id"] == "testwork_p0001"],
+        key=lambda r: r["region_id"],
+    )
+    assert len(rows) == 3
+    # all 3 detected lines found their aligned reference line and passed the CER gate
+    assert all(r["accepted"] and r["evidence_tier"] == "silver" for r in rows)
+    assert len(chunks) == 3
+    # the unmatched 4th reference line never corresponds to any region -- nothing to assert on it
+    # directly (it has no chunk_id/region_id of its own), its absence IS the behaviour under test.
+
+
+def test_transcribe_reference_alignment_refuses_beyond_max_line_diff(synthetic_corpus):
+    """A reference file whose line-count mismatch EXCEEDS cfg['ocr']['max_line_diff'] must still
+    refuse alignment entirely (reference_alignment_failed for every line on that page) -- past that
+    small gap, even a similarity-scored correspondence isn't trustworthy enough to bet a citation on."""
+    from pathlib import Path
+    raw_dir = Path(synthetic_corpus["paths"]["raw_dir"]) / "testwork"
+    # page 1 has 3 detected lines; give it 7 reference lines (a mismatch of 4, past the default
+    # max_line_diff of 2) -- content doesn't matter here, the gap alone must trigger refusal.
+    (raw_dir / "testwork_p0001.ref.txt").write_text(
+        "\n".join(f"reference line {i}" for i in range(7)) + "\n", encoding="utf-8",
     )
     pages = preprocess.run(loader.load_pages(synthetic_corpus), synthetic_corpus)
     regions = layout.detect(pages, synthetic_corpus)
