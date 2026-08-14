@@ -3,7 +3,7 @@ HEADER
 ========================================================================
 Member name: Atika Tabassum Suchi
 Student number: 2105053
-Sections led: Person B — Vision & OCR
+Sections led: Vision & OCR
   - src/doc_agent/vision/layout.py (Stage 2: layout/line detection, noise-box filtering,
     min line height/area thresholds)
   - src/doc_agent/vision/ocr.py (Stage 3: OCR transcription, gold/silver evidence-tier
@@ -12,7 +12,7 @@ Sections led: Person B — Vision & OCR
   - tests/test_ocr.py, tests/test_layout.py
   - notebooks/kb_demo.ipynb — Section 1 (OCR quality: CER/WER scoring against the
     held-out gold set, WER tokenization fix for punctuation-glued tokens)
-  - forms/A2_form.docx — [FILL IN which section(s) you led, if any]
+  - forms/A2_form.docx — section 1,2,3(partial),4(partial)
 
 ========================================================================
 FULL CONVERSATION (unedited)
