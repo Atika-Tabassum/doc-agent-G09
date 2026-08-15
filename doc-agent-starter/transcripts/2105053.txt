@@ -1338,6 +1338,84 @@ The defense answer I'd give
 "We chose global alignment because reference lines and OCR lines form ordered sequences. Independent closest-line matching only considers local similarity and can produce duplicate, reordered, or inconsistent matches. Needleman–Wunsch considers the entire sequence and allows insertions and deletions while preserving the overall order. This gives us a more reliable correspondence before calculating CER, although it has the trade-off of higher complexity and the possibility of incorrect alignment when the OCR is severely corrupted."
 
 
+User: In layout.py, why is the adaptive same-row tolerance calculated as:
+max(5 px, 0.4 × median_line_height)?
+Why specifically 0.4?
+
+Assistant:
+The `0.4` is basically a **practical compromise** between being too strict and too loose when deciding whether two detected lines belong to the same horizontal row.
+
+The formula is:
+
+`y_tolerance = max(5 px, 0.4 × median_line_height)`
+
+Suppose the median detected line height is **30 px**:
+
+* `0.4 × 30 = 12 px`
+* tolerance = `max(5, 12)` = **12 px**
+
+So two lines whose vertical centers differ by up to 12 px can be treated as belonging to the same row.
+
+### Why 0.4?
+
+It allows for the fact that Tesseract's bounding boxes aren't perfectly aligned. In Bengali text, **matras, vowel signs, jofala/rafala, conjuncts, and different glyph shapes** can make individual bounding boxes have slightly different heights and vertical positions even though they are visually on the same printed line.
+
+But we don't want the tolerance to be so large that **two genuinely separate lines get merged**.
+
+So `0.4` gives a reasonably sized fraction of the typical line height:
+
+* **0.2–0.3** → more strict; may split lines that should be grouped.
+* **0.4** → moderate tolerance for normal vertical variation.
+* **0.5+** → increasingly permissive; greater risk of merging adjacent physical lines.
+
+The important point, though, is that **0.4 isn't a mathematically derived constant**. It's a heuristic chosen based on the geometry of the scanned pages and the behavior of Tesseract's line boxes. The `max(5 px, ...)` part also prevents the tolerance from becoming unrealistically tiny on pages with small detected text.
+
+So if someone asks *"Why exactly 0.4?"*, the honest answer is:
+
+> **It is an empirically chosen heuristic that provides enough tolerance for vertical variation in Tesseract's Bengali line bounding boxes without making adjacent printed lines likely to collapse into the same row. It should be validated if the corpus resolution or typography changes.**
+
+
+User: What problem occurs if we use a fixed y_tolerance instead of adapting it to the median detected line height?
+
+Assistant:
+A fixed `y_tolerance` has a problem because **different pages or regions can have different text sizes**.
+
+For example, suppose you choose a fixed tolerance of **10 px**:
+
+* If the text is small and the line height is 15 px, 10 px is very large relative to the line height. Two **separate lines** could be mistakenly grouped together.
+* If the text is large and the line height is 40 px, 10 px may be too small. Two pieces of the **same physical line** whose bounding boxes have slightly different vertical positions could be incorrectly separated.
+
+That's why the adaptive approach uses the median detected line height:
+
+> **small text → smaller tolerance; large text → larger tolerance.**
+
+The median is useful because it represents the typical line size while being less affected by a few unusual detections.
+
+So the main problem with a fixed value is that it is **resolution- and font-size-dependent**. If the scan resolution, cropping, or text size changes, the same fixed number of pixels may behave very differently.
+
+The adaptive formula makes the tolerance scale with the actual typography detected on each page.
+
+
+User: I noticed that layout.py filters detected regions using _MIN_LINE_HEIGHT_PX = 8 and _MIN_LINE_AREA_PX = 40. Why did we introduce these two thresholds? Why are 8 px and 40 px² appropriate for Rabindra Rachanabali Volume 25 specifically, rather than arbitrary values?
+
+Assistant:
+We introduced `_MIN_LINE_HEIGHT_PX = 8` and `_MIN_LINE_AREA_PX = 40` as **noise-floor filters** in Stage 2. Tesseract can produce tiny bounding boxes from scan speckles, punctuation fragments, page artifacts, or other non-text marks; geometric minimum-size filtering is a standard way to suppress such detections before they reach OCR.
+
+For **Rabindra Rachanabali Volume 25**, these values are best understood as **empirical, corpus-specific safeguards**, not universal OCR constants. The scans are high-resolution (around 1610×2436 px), so genuine printed text lines occupy substantially larger regions than isolated noise. The `8 px` height floor prevents extremely thin detections from becoming line regions, while the `40 px²` area floor removes tiny residual components. This is consistent with historical-document OCR pipelines that use minimum geometric dimensions to eliminate noise while preserving actual text components. 
+
+Importantly, we should **not claim that 8 and 40 are theoretically optimal**. Their justification should be: they were chosen as conservative lower bounds after inspecting the corpus and should be validated through threshold-sensitivity testing. If increasing them starts removing legitimate short Bengali text, they are too aggressive.
+
+
+User: Would these thresholds still be safe if the input resolution changed? Since the Volume 25 scans are around 1610 × 2436 px, are these values resolution-dependent?
+
+Assistant:
+No. These thresholds are resolution-dependent because they are defined in pixels.
+
+For the current 1610 × 2436 px Volume 25 scans, 8 px and 40 px² are appropriate as corpus-specific noise floors. If the same pages are downsampled or scanned at a different resolution, genuine text regions will change in pixel size, so these fixed thresholds may become too aggressive or too permissive.
+
+Ideally, for different resolutions, the thresholds should be scaled relative to the estimated text/line size rather than kept as fixed pixel values.
+
+
 User: I am working on filling the stubs in `src/doc_agent/vision/ocr.py` for my Stage 3 implementation. Since my Stage 2 layout detector already supplies line-level bounding boxes (`Region` objects), I need to implement `transcribe_region` in the `Reader` class.
 
 Two technical aspects need clarification for optimal OCR performance on Rabindra Rachanabali (Volume 25):
@@ -4015,6 +4093,215 @@ If the individual tests also exist, we can determine:
 That's much more useful for debugging and for defending the architecture.
 
 One thing I'd be careful about in our project: I wouldn't claim that every one of these stages is currently independently tested unless the actual test files show that. Some are architectural testing targets, while others may be covered by the tests you currently have.
+
+
+User: In ocr.py, the dynamic-programming alignment uses min_line_similarity = 0.5. Why did we choose 0.5 as the minimum similarity required for a reference line to be considered a match?
+
+Assistant:
+Think of `min_line_similarity = 0.5` as a **“good enough to be the same line” filter**.
+
+The DP alignment is trying to match:
+
+* OCR line: `রবীন্দ্রনাথের ...`
+* Reference line: `রবীন্দ্রনাথের ...`
+
+But OCR is not perfect. Bengali OCR might make a few substitutions, miss a matra, merge/split a character, etc. If we required exact equality, many genuinely corresponding lines would fail.
+
+A similarity score is usually normalized between `0` and `1`: `1.0` means identical, while lower values mean more differences. One common formulation is `1 - edit_distance / max(lengths)`. ([PubMed Central (PMC)][1])
+
+So with a threshold of **0.5**:
+
+* `1.0` → definitely matching
+* `0.8` → very similar
+* `0.6` → reasonably similar
+* `0.5` → borderline, but still allowed
+* `< 0.5` → probably not the same line
+
+For example, if two 50-character lines have an edit distance of 20:
+
+`similarity = 1 - 20/50 = 0.60`
+
+So the DP is allowed to align them.
+
+If the distance were 30:
+
+`similarity = 1 - 30/50 = 0.40`
+
+That falls below `0.5`, so we don't trust that alignment.
+
+### Why 0.5 specifically?
+
+It's essentially a **practical compromise**:
+
+* Too high, e.g. `0.8` → legitimate OCR errors cause correct lines to be rejected.
+* Too low, e.g. `0.2` → unrelated lines can be considered matches.
+* `0.5` → requires roughly half or more of the line's character content to remain similar, while still tolerating substantial OCR corruption.
+
+But importantly, **0.5 isn't a magical or theoretically optimal number for Bengali**. Unless we performed a sensitivity experiment comparing 0.3/0.4/0.5/0.6/0.7 on your Volume 25 data, we should call it an **empirical engineering threshold** rather than claiming that 0.5 is proven optimal.
+
+And this is why we have the **second CER gate** afterward: `min_line_similarity=0.5` helps the DP find the *right corresponding line*; the stricter CER threshold then decides whether that matched OCR line is actually good enough to keep.
+
+[1]: https://pmc.ncbi.nlm.nih.gov/articles/PMC5344375/?utm_source=chatgpt.com "Efficient string similarity join in multi-core and distributed systems - PMC"
+
+
+User: What would happen if we used 0.3, 0.7, or 0.8 instead? Would a lower threshold increase false matches while a higher threshold reject legitimate OCR lines containing Bengali matra, jofala, rafala, or conjunct errors?
+
+Assistant:
+Yes, that's the main trade-off.
+
+* **`0.3` — very permissive:**
+  The alignment will accept lines that are quite different. This helps when OCR is badly corrupted, but increases the chance that an OCR line gets matched to the **wrong reference line**. That can make the subsequent CER calculation misleading because you're comparing against the wrong text.
+
+* **`0.5` — balanced:**
+  Requires a substantial amount of character-level similarity while still allowing normal OCR mistakes. This is why it's a reasonable middle ground for our pipeline.
+
+* **`0.7` — stricter:**
+  The alignment becomes more confident that matched lines are genuinely corresponding, but some legitimate matches may fail because Bengali OCR errors can affect multiple Unicode characters—particularly around **matras, jofala, rafala, and conjuncts**.
+
+* **`0.8` — very strict:**
+  Now you're approaching an almost-exact matching requirement. A line with several legitimate OCR errors could fall below the threshold and be treated as unmatched, reducing coverage.
+
+So conceptually:
+
+**Lower threshold → more matches, but more risk of wrong matches.**
+**Higher threshold → more reliable matches, but more legitimate matches rejected.**
+
+One subtle but important point: **`min_line_similarity` doesn't itself decide whether the OCR is good enough to enter the KB.** It primarily helps the DP algorithm determine *which reference line corresponds to which OCR line*. The later **CER gate** makes the quality decision.
+
+And again, we shouldn't say `0.5` is definitely optimal unless you've tested several thresholds on your actual Volume 25 data.
+
+
+User:How does min_line_similarity interact with the CER threshold of 0.15? Why do we need both a line-similarity threshold and a CER acceptance threshold?
+
+Assistant:
+They serve **two different purposes**:
+
+### `min_line_similarity = 0.5`
+
+This is used during **alignment**.
+
+Its job is:
+
+> “Do these two lines look similar enough that they are probably the same line?”
+
+For example, OCR might produce a line with several Bengali character errors. We still want to recognize that it corresponds to a particular reference line.
+
+So `0.5` is about **finding the correct reference line**.
+
+### `CER ≤ 0.15`
+
+This is used after alignment.
+
+Its job is:
+
+> “Now that we've found the corresponding reference line, is our OCR actually accurate enough to trust?”
+
+A CER of `0.15` means the OCR has at most roughly **15% character-level edit distance** from the reference.
+
+So `0.15` is about **quality/acceptance**.
+
+### Why not just use CER?
+
+Because without the similarity threshold, the alignment could pair an OCR line with the **wrong reference line**.
+
+Imagine:
+
+```text
+OCR:       রবীন্দ্রনাথ আজ কলকাতায় গেলেন
+Reference: রবীন্দ্রনাথ আজ শান্তিনিকেতনে গেলেন
+```
+
+There are enough similarities that they might be related, but we still need the alignment mechanism to decide whether they correspond.
+
+The pipeline is therefore roughly:
+
+```text
+OCR lines
+    ↓
+DP alignment
+    ↓
+min_line_similarity ≥ 0.5
+    ↓
+"Okay, this is probably the corresponding reference line"
+    ↓
+Calculate CER
+    ↓
+CER ≤ 0.15 ?
+    ↓
+ACCEPT / SILVER
+```
+
+So the simple distinction is:
+
+**Similarity threshold = “Did I match it to the right line?”**
+
+**CER threshold = “Is the matched OCR line accurate enough to trust?”**
+
+That's why having both is useful.
+
+
+User: Why is min_line_chars set to 1 by default? Would a stricter minimum, such as 3 or 5 characters, be dangerous for Bengali literary documents?
+
+Assistant:
+Yes. The key reason is that **`min_line_chars` counts Unicode code points, not what a human perceives as a Bengali “character.”**
+
+Bengali text can represent a single visible grapheme using multiple Unicode code points because of:
+
+* **matras** (vowel signs)
+* **hasanta/virama**
+* **jofala / rafala**
+* **conjuncts**
+* combining marks
+
+So a visually meaningful word or short line can have fewer code points than you might expect—or a seemingly short Bengali line can have a complicated sequence of code points.
+
+For example, something that visually looks like a compact Bengali unit may internally be represented approximately as:
+
+`consonant + hasanta + consonant + vowel sign`
+
+So setting:
+
+```python
+min_line_chars = 3
+```
+
+or especially:
+
+```python
+min_line_chars = 5
+```
+
+could accidentally discard **legitimate short textual regions**, such as:
+
+* page numbers
+* short headings
+* dialogue fragments
+* punctuation/markers
+* very short literary lines
+* Bengali words containing complex conjunct structures
+
+That's why **`1` is a conservative default**: it essentially says *“don't throw away a region merely because it is short; let the OCR/reference quality gate decide whether it is trustworthy.”*
+
+The trade-off is that `1` allows some tiny noise regions through Stage 2. But that's safer for this corpus because **discarding genuine Bengali text at the layout stage is harder to recover from than allowing a few tiny candidates to reach OCR and later filtering them.**
+
+
+User: How does Unicode representation of Bengali graphemes affect this decision? A visually single Bengali character can consist of multiple Unicode code points, so could a character-count threshold accidentally discard legitimate short text?
+
+Assistant:
+Yes. The important issue is that **Unicode code-point count is not the same as the number of visible Bengali characters (graphemes)**.
+
+For example, a Bengali visual unit such as a consonant with a vowel sign or conjunct can be represented by **multiple Unicode code points**. So something that looks like a single character to a reader may have a Python `len()` greater than 1.
+
+That means:
+
+* `min_line_chars = 1` is deliberately **very permissive**.
+* A threshold like `3` or `5` could accidentally reject legitimate short Bengali text if the implementation counts Unicode code points rather than user-perceived characters.
+* This matters especially for things like **page numbers, short headings, punctuation, isolated Bengali graphemes, and very short literary lines**.
+* More importantly, increasing the threshold doesn't necessarily mean "at least 3 visible Bengali characters"; it means "at least 3 Unicode code points" unless you explicitly implement grapheme-cluster counting.
+
+So for this OCR pipeline, **`1` is a safe default because filtering by length should not throw away potentially valid OCR regions**. It's better to let the quality gate (CER/similarity/confidence) decide whether a short line is trustworthy.
+
+If we ever wanted a stricter threshold, we'd ideally count **Unicode grapheme clusters**, not raw code points.
 
 
 User: What kinds of edge cases should our OCR tests cover?
