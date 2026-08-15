@@ -87,16 +87,22 @@ flowchart LR
     RAW --> L0 --> P1 --> E1 --> HOOK1 --> D2 --> T3 --> HOOK2 --> C4 --> HOOK3 --> M4 --> B4 --> OUT
 ```
 
-**Reading this diagram honestly (updated after DP-3's resolution):** `pipeline.build_knowledge_base(cfg)`
-with the live `config.yaml` now runs the whole chain above end-to-end — Stage 1b's Enhancer is a
-bonus stage (gated to data speciality E1 "severely degraded scans", which this group didn't choose;
-we chose E26 "dirty-ocr", built in Stage 4a) and was disabled via `enhance.enabled: false` rather
-than implemented, and `governance/pii.py` now has a real `detect()`/`redact()`/`_scrub` implementation.
-`tests/test_retrieval.py`'s `test_build_knowledge_base_blocked_by_enhance_stub_with_current_config`
-still pins `Enhancer.apply()`'s stub behaviour as a regression check (in case anyone re-enables it
-without implementing it) but no longer reflects the live config; its sibling,
+**Reading this diagram honestly (updated after DP-3's resolution and the real full-corpus run):**
+`pipeline.build_knowledge_base(cfg)` with the live `config.yaml` now runs the whole chain above
+end-to-end — Stage 1b's Enhancer is a bonus stage (gated to data speciality E1 "severely degraded
+scans", which this group didn't choose; we chose E26 "dirty-ocr", built in Stage 4a) and was
+disabled via `enhance.enabled: false` rather than implemented, and `governance/pii.py` now has a
+real `detect()`/`redact()`/`_scrub` implementation. `tests/test_retrieval.py`'s
+`test_build_knowledge_base_blocked_by_enhance_stub_with_current_config` still pins
+`Enhancer.apply()`'s stub behaviour as a regression check (in case anyone re-enables it without
+implementing it) but no longer reflects the live config; its sibling,
 `test_build_knowledge_base_blocked_by_pii_stub_once_enhance_disabled`, now asserts a clean run
 through `store.build()` with a planted PII string confirmed redacted in the persisted `chunks.jsonl`.
+This chain has now also been exercised for real, at full corpus scale — not just by unit tests: 396
+raw pages across 5 works (`bishwaparichay`, `tin_sangi`, `arogya`, `chandalika`, `chitrangada`;
+`rachanabali_vol25` dropped as a likely duplicate) were OCR'd, producing 10,436 lines of which 7,292
+were accepted (21 gold, 7,271 silver) into 279 indexed chunks — see §2.4's updated notes and
+`configs/design_choices.md` for the full evidence trail.
 
 ---
 
@@ -137,11 +143,14 @@ flowchart TD
 **Why this matters to Stage 4 (mine):** `doc_id` is assigned *here*, at the very first stage, purely
 from directory/filename structure — and `chunk.split()`'s core leakage guarantee (never merge lines
 across `doc_id`, tested in Milestone 4 / `test_split_never_merges_across_documents`) is only as
-correct as this resolution logic. If `scripts/get_data.sh`'s flat single-`doc_id` layout
-(`data/raw/rachanabali_vol25/*.png`, no per-work subfolders — see DP-1) is used as-is, every page
-resolves to the *same* `doc_id`, and the leakage guarantee becomes vacuous (nothing to leak across,
-because there's only one document). That's not a chunk.py bug — it's exactly why DP-1 flags the
-real corpus run as blocked on more than just Tesseract.
+correct as this resolution logic. `scripts/get_data.sh` on its own only produces a flat
+single-`doc_id` layout (`data/raw/rachanabali_vol25/*.png`, no per-work subfolders) and prints
+instructions that this must be manually re-split before it's usable — which is exactly what was
+done for the real corpus run: `data/raw/` now holds five per-work subfolders
+(`bishwaparichay/`, `tin_sangi/`, `arogya/`, `chandalika/`, `chitrangada/`), with the original flat
+`rachanabali_vol25/` dropped as a likely duplicate once the split existed. **Formerly DP-1, now
+resolved** — every page resolves to its own work's `doc_id`, so the leakage guarantee is live, not
+vacuous, in the real 396-page run.
 
 ### 2.1 Stage 1a — Preprocess (`ingest/preprocess.py::run`)
 
@@ -227,7 +236,7 @@ without implementing it. The live path is A→B→C: every real call now proceed
 
 ```mermaid
 flowchart TD
-    A["for each Page:<br/>cv2.imread(image_path, GRAYSCALE)"] --> B["pytesseract.image_to_data(<br/>img, lang='ben', --oem 1 --psm 3)"]
+    A["for each Page:<br/>cv2.imread(image_path, GRAYSCALE)"] --> B["pytesseract.image_to_data(<br/>img, lang='ben', --oem 1 --psm 4)"]
     B --> C["_group_words_into_lines(data, score_thr)"]
 
     subgraph GROUP["group by (block_num, par_num, line_num)"]
@@ -282,12 +291,12 @@ flowchart TD
     CHECK1 -->|yes, or no layout_meta.jsonl yet| CHECK2{"2. len(norm_text) &lt; min_line_chars<br/>(default 1)?"}
 
     CHECK2 -->|yes| REJ2["reject_reason = REJECT_TOO_SHORT<br/>evidence_tier = 'raw'"]
-    CHECK2 -->|no| CHECK3{"3. Gold check:<br/>page has aligned gold line in<br/>grading_kit/labels.jsonl AND<br/>CER(norm_text, gold_line) == 0.0?"}
+    CHECK2 -->|no| CHECK3{"3. Gold check:<br/>page has a gold line fuzzy-aligned via<br/>_align_lines (DP over Levenshtein similarity,<br/>tolerates up to max_line_diff=4 mismatch) from<br/>grading_kit/labels.jsonl AND<br/>CER(norm_text, gold_line) == 0.0?"}
 
     CHECK3 -->|"yes — EXACT match"| GOLD["evidence_tier = 'gold'<br/>accepted = True<br/>→ Chunk(id=chunk_id, doc_id, text=norm_text, page_ids=[page_id])"]
-    CHECK3 -->|"no (no gold label, alignment<br/>failed, or CER &gt; 0)"| CHECK4{"4. Silver gate:<br/>ref line exists (data/raw/&lt;doc&gt;/&lt;page&gt;.ref.txt<br/>— NOT populated by get_data.sh today, DP-1)<br/>AND CER(norm_text, ref_line) ≤ max_cer_target (0.15)?"}
+    CHECK3 -->|"no (no gold label, alignment<br/>failed, or CER &gt; 0)"| CHECK4{"4. Silver gate:<br/>ref line fuzzy-aligned the same way from<br/>data/raw/&lt;doc&gt;/&lt;page&gt;.ref.txt or cfg.ocr.reference_dir<br/>AND CER(norm_text, ref_line) ≤ max_cer_target (0.15)?"}
 
-    CHECK4 -->|"no ref available"| REJ3["reject_reason = reference_alignment_failed<br/>evidence_tier = 'raw'<br/>(the SAFE default while .ref.txt is unpopulated)"]
+    CHECK4 -->|"no ref available"| REJ3["reject_reason = reference_alignment_failed<br/>evidence_tier = 'raw'<br/>(the SAFE default when no reference is available for a line)"]
     CHECK4 -->|"CER &gt; 0.15"| REJ4["reject_reason = cer_above_threshold<br/>evidence_tier = 'raw'"]
     CHECK4 -->|"CER ≤ 0.15"| SILVER["evidence_tier = 'silver'<br/>accepted = True<br/>→ Chunk(id=chunk_id, doc_id, text=norm_text, page_ids=[page_id])"]
 
@@ -319,14 +328,17 @@ flowchart TD
 - `chunk_id` is assigned **here**, at Stage 3 (`f"{page_id}_l{idx:03d}"`, `ocr.py:269`) — Stage 4's
   merged-chunk IDs (`f"{doc_id}_c{idx:05d}"`, `chunk.py:91`) are a *different* ID space entirely;
   the mapping between them lives in `chunk_meta.jsonl`'s `source_line_ids` field.
-- Right now, with no `.ref.txt` files populated by `scripts/get_data.sh` (DP-1) and
-  `grading_kit/labels.jsonl` holding only one placeholder row (DP-2), **every line on the real
-  corpus would currently fall through to `reject_reason = reference_alignment_failed`** — meaning a
-  real 437-page run, even once DP-3's two stub blockers are fixed, would produce **zero** accepted
-  `Chunk`s and an empty index, until either `.ref.txt` sidecars or real `labels.jsonl` gold rows
-  exist. This is a third, independent prerequisite for DP-1's "real corpus run," not previously
-  spelled out this explicitly — flagging it here because tracing the OCR gate line-by-line is what
-  surfaced it.
+- **Formerly DP-1/DP-2, now resolved.** Earlier revisions of this diagram flagged that with no
+  `.ref.txt` files populated by `scripts/get_data.sh` and `grading_kit/labels.jsonl` holding only a
+  placeholder row, every line on the real corpus would fall through to
+  `reject_reason = reference_alignment_failed`, producing zero accepted `Chunk`s. That's no longer
+  the live state: `grading_kit/labels.jsonl` now holds 10 independently human-reviewed gold pages,
+  additional bulk per-work gold/reference files supply silver reference text for the rest of the
+  corpus (a real mislabeling was found and fixed for `chandalika`/`chitrangada`/`bishwaparichay`'s
+  bulk-gold files, which were superseded by silver), and `_align_lines`'s fuzzy DP alignment (not
+  the old exact-line-count-only match) is what actually recovers a usable reference/gold line per
+  detected region. The real run reflects this: 10,436 lines OCR'd, 7,292 accepted (21 gold, 7,271
+  silver) into 279 chunks — not zero.
 
 ### 2.5 Stage 4a — Chunk (`index/chunk.py::split`) — mine
 
@@ -572,15 +584,17 @@ actually executes.
 
 ## 6. Real artifacts, file by file
 
-| File | Written by | Read by | Row shape |
-|---|---|---|---|
-| `data/processed/<doc_id>/<page_id>.png` | `preprocess.run` | `layout.detect`, `ocr.transcribe` | binarized image |
-| `data/processed/layout_meta.jsonl` | `layout.detect` | `ocr.transcribe` (provenance check) | `region_id, page_id, bbox, block/par/line_num` |
-| `data/processed/ocr_meta.jsonl` | `ocr.transcribe` | `chunk.split` | `region_id, chunk_id, page_id, ocr_confidence, cer, cer_threshold, ocr_config, ocr_text_raw, ocr_text_normalized, reference_text_normalized, evidence_tier, accepted, reject_reason` |
-| `data/processed/chunk_meta.jsonl` | `chunk.split` | `store.build` | `chunk_id, ocr_confidence, tier, source_line_ids` |
-| `data/processed/index/index.faiss` | `store.build` | `store.load` (→ A3 `retriever.py`) | FAISS binary index, `METRIC_INNER_PRODUCT` |
-| `data/processed/index/chunks.jsonl` | `store.build` | `store.load` (→ A3 `retriever.py`) | `id, doc_id, text, page_ids, ocr_confidence, tier` — row *i* ↔ FAISS internal id *i* |
+| File | Written by | Read by | Row shape | Committed? |
+|---|---|---|---|---|
+| `data/processed/<doc_id>/<page_id>.png` | `preprocess.run` | `layout.detect`, `ocr.transcribe` | binarized image | per-machine (not committed) |
+| `data/processed/layout_meta.jsonl` | `layout.detect` | `ocr.transcribe` (provenance check) | `region_id, page_id, bbox, block/par/line_num` | ✅ committed — real, 10,436 rows |
+| `data/processed/ocr_meta.jsonl` | `ocr.transcribe` | `chunk.split` | `region_id, chunk_id, page_id, ocr_confidence, cer, cer_threshold, ocr_config, ocr_text_raw, ocr_text_normalized, reference_text_normalized, evidence_tier, accepted, reject_reason` | ✅ committed — real, 10,436 rows, 7,292 accepted |
+| `data/processed/chunk_meta.jsonl` | `chunk.split` | `store.build` | `chunk_id, ocr_confidence, tier, source_line_ids` | produced by the real build feeding `index/` below |
+| `data/processed/index/index.faiss` | `store.build` | `store.load` (→ A3 `retriever.py`) | FAISS binary index, `METRIC_INNER_PRODUCT` | ✅ committed — real, 279 vectors (built in a separate GPU/Kaggle session, same code) |
+| `data/processed/index/chunks.jsonl` | `store.build` | `store.load` (→ A3 `retriever.py`) | `id, doc_id, text, page_ids, ocr_confidence, tier` — row *i* ↔ FAISS internal id *i* | ✅ committed — real, 279 rows |
 
-All six are gitignored (per-machine, rebuilt by `scripts/build_index.sh`) — none of them are
-expected to exist in a fresh clone until `make ingest index` (or the equivalent test fixtures used
-throughout `tests/test_retrieval.py`) has actually run.
+Per-page images stay per-machine (gitignored via `data/raw/`, and `data/processed/<doc_id>/` is
+rebuildable from it) — but the JSONL/index artifacts above are the actual evidence trail for the
+real full-corpus run and are committed rather than left to `make ingest index` to regenerate.
+`notebooks/kb_demo.ipynb` Sections 2–6 load the committed `index/` directly via `store.load()`
+rather than rebuilding it.
