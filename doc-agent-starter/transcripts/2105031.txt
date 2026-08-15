@@ -5240,4 +5240,4 @@ REFLECTION
   file, I made a point of confirming exactly which file was open before letting it redo
   the merge a second time, rather than assuming the first attempt's explanation was
   automatically correct — it turned out to be right, but I wanted it verified against the
-  actual open file path before repeating the same operation.
+  actual open file path before repeating the same operation
