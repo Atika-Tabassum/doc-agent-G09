@@ -32,7 +32,7 @@ _DEFAULT_MIN_LINE_CHARS = 1   # reject only genuinely empty OCR output by defaul
                               # often need several Unicode codepoints, so a stricter default risks
                               # rejecting legitimate short lines (page numbers, single-word headings).
                               # Raise cfg['ocr']['min_line_chars'] once real noise patterns are visible.
-_DEFAULT_MAX_LINE_DIFF = 2         # overridable via cfg['ocr']['max_line_diff'] -- see _align_lines
+_DEFAULT_MAX_LINE_DIFF = 4         # overridable via cfg['ocr']['max_line_diff'] -- see _align_lines
 _DEFAULT_MIN_LINE_SIMILARITY = 0.5  # overridable via cfg['ocr']['min_line_similarity']
 
 
@@ -327,7 +327,7 @@ def transcribe(regions: list[Region], cfg: dict) -> list[Chunk]:
          page's text, not that OUR OCR of this exact line matches it. Alignment (which gold line, if
          any, corresponds to which detected region) is content-aware, not purely positional — see
          _align_lines: an exact line-count match aligns positionally as before, a small (<=
-         cfg['ocr']['max_line_diff'], default 2) mismatch aligns by per-line similarity, and lines with
+         cfg['ocr']['max_line_diff'], default 4) mismatch aligns by per-line similarity, and lines with
          no aligned counterpart simply have no gold line here (fall through to check 4, same as a page
          with no gold label at all).
       4. Standard silver/raw gate — CER against the IA reference, accept as "silver" if <= max_cer_target,

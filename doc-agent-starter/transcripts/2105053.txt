@@ -5767,6 +5767,7 @@ REFLECTION
 
 7.AI could suggest possible solutions, but the final decisions still required checking the implementation, tests, and project requirements manually.
 
+8.I raised max_line_diff from 2 to 4 after empirical Kaggle testing showed it roughly doubled tin_sangi's accepted-line rate with no CER degradation.
 
 
 - Anything I disagreed with or changed after using it:

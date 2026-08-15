@@ -237,7 +237,7 @@ def test_transcribe_gold_requires_exact_match_not_just_page_membership(synthetic
 
 
 def test_transcribe_reference_alignment_tolerates_small_line_count_mismatch(synthetic_corpus, tmp_path):
-    """A reference file with a SMALL (<= cfg['ocr']['max_line_diff'], default 2) line-count mismatch
+    """A reference file with a SMALL (<= cfg['ocr']['max_line_diff'], default 4) line-count mismatch
     against the detected region count must still align via _align_lines' content-aware DP (a
     Levenshtein-ratio-scored correspondence, not a naive index shift) -- the genuinely-matching lines
     are accepted, and the one extra/unmatched reference line is simply absent from the alignment
@@ -279,10 +279,10 @@ def test_transcribe_reference_alignment_refuses_beyond_max_line_diff(synthetic_c
     small gap, even a similarity-scored correspondence isn't trustworthy enough to bet a citation on."""
     from pathlib import Path
     raw_dir = Path(synthetic_corpus["paths"]["raw_dir"]) / "testwork"
-    # page 1 has 3 detected lines; give it 7 reference lines (a mismatch of 4, past the default
-    # max_line_diff of 2) -- content doesn't matter here, the gap alone must trigger refusal.
+    # page 1 has 3 detected lines; give it 9 reference lines (a mismatch of 6, past the default
+    # max_line_diff of 4) -- content doesn't matter here, the gap alone must trigger refusal.
     (raw_dir / "testwork_p0001.ref.txt").write_text(
-        "\n".join(f"reference line {i}" for i in range(7)) + "\n", encoding="utf-8",
+        "\n".join(f"reference line {i}" for i in range(9)) + "\n", encoding="utf-8",
     )
     pages = preprocess.run(loader.load_pages(synthetic_corpus), synthetic_corpus)
     regions = layout.detect(pages, synthetic_corpus)
